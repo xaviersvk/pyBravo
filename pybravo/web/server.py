@@ -4700,8 +4700,16 @@ async def websocket_state(websocket: WebSocket):
         while True:
             bravo = get_bravo()
             if bravo.is_connected:
-                state = bravo.get_state()
-                await websocket.send_json(state)
+                # Off the event loop: on hardware a state read is dozens of
+                # wire round trips, and doing it inline stalled every other
+                # request (an accessory command took 1.5-2 s) while it ran.
+                try:
+                    state = await asyncio.to_thread(bravo.get_state)
+                except Exception:
+                    logger.debug("State snapshot failed; skipping this frame", exc_info=True)
+                    state = None
+                if state is not None:
+                    await websocket.send_json(state)
             sleep_s = 1 / 30
             if bravo.profile.connection.controller_type in {"darwin", "darwin_native", "agile", "agile_7612"}:
                 sleep_s = 0.2

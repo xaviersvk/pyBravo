@@ -44,6 +44,7 @@ CMD_READ_WEIGH_PAD = 0xB3
 
 DIRECTIONS = {"forward": 1, "reverse": 0}
 MAX_RUN_S = 600.0
+KEEPALIVE_INTERVAL_S = 0.3  # status polls while pumps run, as the instrument software does
 
 SerialSender = Callable[[bytes], bytes]
 
@@ -82,6 +83,10 @@ def build_run_pump(module: int, pump: int, direction: str, speed_pct: float) -> 
 
 def build_stop_pumps() -> bytes:
     return bytes([CMD_STOP_PUMPS, 0, 0, 0, 0, 0, 0, 0, 0])
+
+
+def build_pump_status(module: int) -> bytes:
+    return bytes([CMD_PUMP_STATUS, module & 0xFF, 0, 0, 0, 0, 0, 0, 0])
 
 
 def build_read_weigh_pad(module: int) -> bytes:
@@ -216,9 +221,13 @@ class AutofillStation:
 
     def _watchdog(self, token: int, duration_s: float) -> None:
         deadline = time.monotonic() + duration_s
+        next_keepalive = time.monotonic() + KEEPALIVE_INTERVAL_S
         while time.monotonic() < deadline:
             if self._run_token != token:
                 return  # stopped or superseded by another run
+            if time.monotonic() >= next_keepalive:
+                self._keepalive()
+                next_keepalive = time.monotonic() + KEEPALIVE_INTERVAL_S
             time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
         with self._lock:
             if self._run_token != token:
@@ -231,6 +240,19 @@ class AutofillStation:
                     logger.error("Autofill watchdog stop attempt %d failed: %s", attempt + 1, exc)
                     time.sleep(0.2)
             logger.error("Autofill watchdog could not stop the pumps; they may still be running")
+
+    def _keepalive(self) -> None:
+        """Poll the pump module's status while pumps run.
+
+        The module stops its pumps by itself after a short while unless it
+        keeps hearing from the host; the instrument's own software polls
+        ``AF`` about three times a second during a run, and so do we.
+        """
+        for module in sorted({self._config.fill.module, self._config.empty.module}):
+            try:
+                self._send(build_pump_status(module), "pump status")
+            except Exception as exc:
+                logger.warning("Autofill keepalive to module %d failed: %s", module, exc)
 
     def _stop_quietly(self) -> None:
         try:
