@@ -11,12 +11,33 @@ lokálne na laboratórnom PC (pozri koniec).
 | [kelsorj/pyBravo#2](https://github.com/kelsorj/pyBravo/pull/2) | Oprava importu labware z exportu registrov a Labware Editora, ktorý nuloval geometriu jamiek | otvorený |
 | [kelsorj/pyBravo#3](https://github.com/kelsorj/pyBravo/pull/3) | Autofill station: pumpy, váha, UI panel a 3D model. **Zatiaľ len ručné ovládanie, nie je pripravené na pipeline.** | otvorený |
 | [kelsorj/pyBravo#4](https://github.com/kelsorj/pyBravo/pull/4) | Farebné označenie pôvodu: Imported / Imported, edited / Local | otvorený |
+| [kelsorj/pyBravo#5](https://github.com/kelsorj/pyBravo/pull/5) | Kroky pre workflow: **Pump Reagent**, Stop Pumps, Read Level a oprava výšky od dna pri Mix/Aspirate/Dispense. Stavia na #3. | otvorený |
 
 Vetvy v našom forku:
 - `fix/labware-registry-import` (PR #2)
 - `feature/autofill-station` (PR #3)
 - `feature/provenance-colours` (PR #4)
+- `feature/autofill-workflow-steps` (PR #5, postavené na #3)
 - `lab-notes` (tento súbor)
+
+## Umývanie tipov ako workflow (PR #5)
+
+Krok **Pump Reagent** je analógiou rovnomennej úlohy z pôvodného softvéru.
+Jeho parametre:
+- **Reservoir mode** (Fill/Empty), rýchlosť pumpy a čas behu
+- **How often**: čerpá pri 1. prechode a potom pri každom N-tom
+- **Allow concurrent operation**: ďalšie kroky idú počas čerpania
+- **Run second pump**: zapne aj druhú pumpu
+- **Weigh station**: prahy akcie a zastavenia
+
+Umývanie tipov je slučka (Loop) s tromi krokmi: Pump Reagent Fill → Mix na
+pozícii stanice, ako keby to bola doska → Pump Reagent Empty. Vodu sa dá
+meniť aj počas miešania, keď sa zapne druhá pumpa a súbežný beh.
+
+Naše konkrétne procedúry („Tip wash: fill - mix - empty (5x)“ a „Tip wash:
+flowing (5x)“: tipy 70 µL z pozície 9, umývanie v 3, späť do 9) sú lokálne
+workflowy v `~/.pybravo/workflows` na laboratórnom PC, nie v repozitári.
+Hodnoty miešania sú v nich zatiaľ zástupné.
 
 ## 1. Import z exportu registrov
 
