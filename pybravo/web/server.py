@@ -937,6 +937,14 @@ class TeleshakeActionRequest(BaseModel):
     direction: str | None = None
 
 
+class AutofillRunRequest(BaseModel):
+    duration_s: float
+    fill: bool = True
+    empty: bool = True
+    fill_speed_pct: float | None = None
+    empty_speed_pct: float | None = None
+
+
 class LiquidClassRequest(BaseModel):
     name: str | None = None
     description: str | None = None
@@ -1740,6 +1748,46 @@ async def stop_teleshake(accessory_id: str):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         logger.warning("Teleshake stop failed for %s: %s", accessory_id, exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/api/accessories/{accessory_id}/autofill/level", **_route_meta("State", "Read an autofill weigh pad", "Reads the raw weigh-pad A/D value and the fill level computed from the profile's tare and range."))
+async def read_autofill_level(accessory_id: str):
+    try:
+        return get_bravo().read_autofill_level(accessory_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.warning("Autofill weigh-pad read failed for %s: %s", accessory_id, exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/accessories/{accessory_id}/autofill/run", **_route_meta("State", "Run autofill pumps for a set time", "Starts the fill and/or empty pump and stops them after duration_s (at most 600 s). The pumps keep running until stopped, so the server always schedules the stop."))
+async def run_autofill_pumps(accessory_id: str, req: AutofillRunRequest):
+    try:
+        return get_bravo().run_autofill_pumps(
+            accessory_id,
+            duration_s=req.duration_s,
+            fill=req.fill,
+            empty=req.empty,
+            fill_speed_pct=req.fill_speed_pct,
+            empty_speed_pct=req.empty_speed_pct,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.warning("Autofill pump start failed for %s: %s", accessory_id, exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/accessories/{accessory_id}/autofill/stop", **_route_meta("State", "Stop autofill pumps", "Stops every pump on the autofill station's pump module."))
+async def stop_autofill_pumps(accessory_id: str):
+    try:
+        return get_bravo().stop_autofill_pumps(accessory_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.warning("Autofill pump stop failed for %s: %s", accessory_id, exc)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
