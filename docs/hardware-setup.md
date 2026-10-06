@@ -682,6 +682,8 @@ accessories:
         empty_pump: 2
         empty_direction: reverse
         empty_speed_pct: 50
+      model:
+        path: builtin:autofill_tray   # tray visual; the liquid follows the level
 ```
 
 | Field | Meaning |

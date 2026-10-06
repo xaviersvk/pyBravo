@@ -831,8 +831,18 @@ function resolveStaticModelUrl(modelPath, cacheKey) {
     return `/static/${encoded}?v=${cacheKey}`;
 }
 
+// model.path values: a glTF path, a built-in visual ("builtin:..."), or "none"
+// for a standard deck position. Unset keeps the old behaviour: the Teleshake
+// model for a Teleshake, a standard position for everything else.
+const ACCESSORY_MODEL_NONE = 'none';
+const AUTOFILL_TRAY_MODEL = 'builtin:autofill_tray';
+const ACCESSORY_BUILTIN_MODELS = [
+    { name: 'Autofill Station (tray)', path: AUTOFILL_TRAY_MODEL },
+];
+
 function accessoryModelPath(device) {
     const configured = String(device?.model?.path || '').trim();
+    if (configured === ACCESSORY_MODEL_NONE) return '';
     if (configured) return configured;
     return device?.type === 'teleshake' ? DEFAULT_TELESHAKE_MODEL_PATH : '';
 }
@@ -851,7 +861,7 @@ function enabledAccessoriesAtLocation(location) {
 function updateDeckPadVisibility() {
     for (const [loc, meshes] of deckSlotPadMeshes.entries()) {
         const replacesPad = enabledAccessoriesAtLocation(loc).some(item => (
-            item.type === 'teleshake' || item.type === 'autofill' || Boolean(accessoryModelPath(item))
+            Boolean(accessoryModelPath(item))
         ));
         for (const mesh of meshes) {
             mesh.visible = !replacesPad;
@@ -1913,7 +1923,7 @@ function setAutofillVisualLevel(deviceId, levelPct) {
 }
 
 async function buildAccessoryMesh(device) {
-    if (device?.type === 'autofill' && !String(device?.model?.path || '').trim()) {
+    if (accessoryModelPath(device) === AUTOFILL_TRAY_MODEL) {
         return buildAutofillStationMesh(device);
     }
     const url = resolveAccessoryModelUrl(device);
@@ -4646,7 +4656,11 @@ function defaultAccessory(type) {
             : type === 'autofill'
                 ? { ...AUTOFILL_DEFAULT_SETTINGS }
                 : { default_rpm: 100, default_direction: 'NWSE', temperature_enabled: false },
-        model: { path: type === 'teleshake' ? DEFAULT_TELESHAKE_MODEL_PATH : '' },
+        model: {
+            path: type === 'teleshake'
+                ? DEFAULT_TELESHAKE_MODEL_PATH
+                : (type === 'autofill' ? AUTOFILL_TRAY_MODEL : ''),
+        },
         teachpoint_hint: {},
     }, state.accessoryDevices.length);
 }
@@ -4773,27 +4787,28 @@ function renderAccessoryList() {
     scheduleDeckVisualRefresh();
 }
 
-// Accessory 3D model: "Built-in" leaves model.path empty so each type uses its
-// own visual (the Teleshake model, the procedural autofill tray); otherwise a
-// model from frontend/accessories or a custom path.
+// Accessory 3D model, chosen from a list: a standard deck position, a built-in
+// visual such as the autofill tray, a glTF model from frontend/accessories, or
+// a custom path.
 let accessoryModelOptions = [];
 
 async function loadAccessoryModelOptions() {
     const res = await apiCall('/api/accessories/models', 'GET');
     accessoryModelOptions = Array.isArray(res?.models) ? res.models : [];
-    populateAccessoryModelChoice(String(selectedAccessory()?.model?.path || '').trim());
+    populateAccessoryModelChoice(selectedAccessory());
 }
 
-function populateAccessoryModelChoice(path) {
+function populateAccessoryModelChoice(device) {
     const select = document.getElementById('prof-accessory-model-choice');
     if (!select) return;
+    const known = [...ACCESSORY_BUILTIN_MODELS, ...accessoryModelOptions];
     select.replaceChildren(
-        new Option('Built-in (default for type)', '__default__'),
-        ...accessoryModelOptions.map(model => new Option(model.name, model.path)),
+        new Option('Standard position', ACCESSORY_MODEL_NONE),
+        ...known.map(model => new Option(model.name, model.path)),
         new Option('Custom path…', '__custom__'),
     );
-    const known = accessoryModelOptions.some(model => model.path === path);
-    select.value = !path ? '__default__' : (known ? path : '__custom__');
+    const path = accessoryModelPath(device);
+    select.value = !path ? ACCESSORY_MODEL_NONE : (known.some(model => model.path === path) ? path : '__custom__');
     setInput('prof-accessory-model-path', select.value === '__custom__' ? path : '');
     updateAccessoryModelPathRow();
 }
@@ -4805,8 +4820,7 @@ function updateAccessoryModelPathRow() {
 }
 
 function readAccessoryModelChoice() {
-    const choice = document.getElementById('prof-accessory-model-choice')?.value || '__default__';
-    if (choice === '__default__') return '';
+    const choice = document.getElementById('prof-accessory-model-choice')?.value || ACCESSORY_MODEL_NONE;
     if (choice === '__custom__') return (document.getElementById('prof-accessory-model-path')?.value || '').trim();
     return choice;
 }
@@ -4844,7 +4858,7 @@ function populateAccessoryEditor(device) {
     if (locSel) locSel.value = String(device.location || 0);
     setInput('prof-accessory-port', device.connection?.port || (device.type === 'barcode_reader' ? 'COM5' : 'COM4'));
     setCheck('prof-accessory-holds-labware', device.holds_labware !== false);
-    populateAccessoryModelChoice(String(device.model?.path || '').trim());
+    populateAccessoryModelChoice(device);
     setInput('prof-accessory-z-hint', device.teachpoint_hint?.z_delta_mm ?? 0);
 
     const scannerType = document.getElementById('prof-accessory-barcode-device-type');
