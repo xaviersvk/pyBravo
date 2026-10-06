@@ -14,6 +14,7 @@ enums, whose registry numeric values are not documented in this codebase).
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -414,6 +415,14 @@ def reg_to_profile(text: str) -> tuple[BravoProfile, list[str]]:
     profile = BravoProfile.default()
     profile.name = name
     warnings: list[str] = []
+    # Provenance, so the UI can tell imported configuration from local edits.
+    profile.extra = {
+        "origin": {
+            "kind": "registry_import",
+            "source_name": name,
+            "imported_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+    }
 
     _apply_root(profile, sections.get("", {}), warnings)
 
