@@ -1872,10 +1872,11 @@ function buildAutofillStationMesh(device) {
     const trayBaseZ = g.padH + g.tubH - g.trayH;
     addOpenBox(group, AUTOFILL_MATERIALS.tray, g.trayL, g.trayW, g.trayH, g.trayWall, trayBaseZ);
 
-    for (const y of [-0.018, 0.018]) {
+    // Hose fittings leave through the back wall (+Y, toward deck row 1-3),
+    // near the right-hand corner.
+    for (const x of [0.030, 0.052]) {
         const fitting = new THREE.Mesh(new THREE.CylinderGeometry(0.004, 0.004, 0.012, 16), AUTOFILL_MATERIALS.fitting);
-        fitting.rotation.z = Math.PI / 2;
-        fitting.position.set(g.tubL / 2 + 0.006, y, g.padH + g.tubH * 0.55);
+        fitting.position.set(x, g.tubW / 2 + 0.006, g.padH + g.tubH * 0.55);
         group.add(fitting);
     }
 
