@@ -831,14 +831,12 @@ function resolveStaticModelUrl(modelPath, cacheKey) {
     return `/static/${encoded}?v=${cacheKey}`;
 }
 
-// model.path values: a glTF path, a built-in visual ("builtin:..."), or "none"
-// for a standard deck position. Unset keeps the old behaviour: the Teleshake
-// model for a Teleshake, a standard position for everything else.
+// model.path values: a glTF path, or "none" for a standard deck position.
+// Unset keeps the old behaviour: the Teleshake model for a Teleshake, a
+// standard position for everything else. A model with a node named "liquid"
+// shows the autofill weigh-pad level (see scripts/build_autofill_tray_model.py).
 const ACCESSORY_MODEL_NONE = 'none';
-const AUTOFILL_TRAY_MODEL = 'builtin:autofill_tray';
-const ACCESSORY_BUILTIN_MODELS = [
-    { name: 'Autofill Station (tray)', path: AUTOFILL_TRAY_MODEL },
-];
+const AUTOFILL_TRAY_MODEL = '/static/accessories/AutofillStation.gltf';
 
 function accessoryModelPath(device) {
     const configured = String(device?.model?.path || '').trim();
@@ -1794,6 +1792,7 @@ function normalizeAccessoryModel(model, device) {
 }
 
 function buildFallbackAccessoryMesh(device) {
+    if (device?.type === 'autofill') return buildAutofillStationMesh(device);
     if (device?.type !== 'teleshake') return null;
     const group = new THREE.Group();
     const base = new THREE.Mesh(
@@ -1902,6 +1901,7 @@ function buildAutofillStationMesh(device) {
 
     // Labware placed here is the tray itself, so do not lift it onto the tub.
     group.userData.accessoryHeightM = 0;
+    group.userData.autofillProcedural = true;
     return group;
 }
 
@@ -1910,8 +1910,13 @@ function applyAutofillLevel(deviceId) {
     if (!liquid) return;
     const level = autofillLevels.get(deviceId);
     const fraction = Number.isFinite(level) ? Math.min(1, Math.max(0, level / 100)) : 0;
-    const height = Math.max(0.0005, liquid.userData.depth * fraction);
     liquid.visible = fraction > 0.005;
+    if (liquid.userData.gltfLiquid) {
+        // glTF "liquid" node: modelled full, bottom at its origin, +Y up.
+        liquid.scale.y = Math.max(0.001, fraction);
+        return;
+    }
+    const height = Math.max(0.0005, liquid.userData.depth * fraction);
     liquid.scale.z = height;
     liquid.position.z = liquid.userData.floorZ + height / 2;
 }
@@ -1923,9 +1928,6 @@ function setAutofillVisualLevel(deviceId, levelPct) {
 }
 
 async function buildAccessoryMesh(device) {
-    if (accessoryModelPath(device) === AUTOFILL_TRAY_MODEL) {
-        return buildAutofillStationMesh(device);
-    }
     const url = resolveAccessoryModelUrl(device);
     if (!url) return null;
     const cacheKey = `${url}|${device?.type || 'accessory'}`;
@@ -1941,13 +1943,25 @@ async function buildAccessoryMesh(device) {
                 const clone = SkeletonUtils.clone(source);
                 wrapper.add(clone);
                 wrapper.userData.accessoryHeightM = normalizeAccessoryModel(clone, device);
+                // Labware at an autofill station is the tray itself: do not lift it onto the model.
+                if (device?.type === 'autofill') wrapper.userData.accessoryHeightM = 0;
                 wrapper.rotation.z = accessoryDeckYaw(device);
                 resolve(wrapper);
             }, undefined, () => resolve(buildFallbackAccessoryMesh(device)));
         }));
     }
     const template = await accessoryTemplateCache.get(cacheKey);
-    return template ? template.clone(true) : null;
+    if (!template) return null;
+    // The procedural fallback is built per device and already registered.
+    if (template.userData.autofillProcedural) return template;
+    const instance = template.clone(true);
+    const liquid = instance.getObjectByName('liquid');
+    if (liquid && device?.id) {
+        liquid.userData.gltfLiquid = true;
+        autofillLiquidMeshes.set(device.id, liquid);
+        applyAutofillLevel(device.id);
+    }
+    return instance;
 }
 
 async function refreshAccessoryScene() {
@@ -4801,7 +4815,7 @@ async function loadAccessoryModelOptions() {
 function populateAccessoryModelChoice(device) {
     const select = document.getElementById('prof-accessory-model-choice');
     if (!select) return;
-    const known = [...ACCESSORY_BUILTIN_MODELS, ...accessoryModelOptions];
+    const known = accessoryModelOptions;
     select.replaceChildren(
         new Option('Standard position', ACCESSORY_MODEL_NONE),
         ...known.map(model => new Option(model.name, model.path)),
