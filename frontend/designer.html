@@ -7239,6 +7239,10 @@ function handleWorkflowEvent(data) {
             });
             timelineRecord(null, timeline._lastNodeId, `barcode @${data.location}: ${data.barcode || '(empty)'}`);
             break;
+        case 'workflow:autofill_level':
+            // Weigh-pad level of an autofill station, shown as liquid in its tray.
+            designerState.robotScene?.setReservoirLevel(data.location, data.level_pct);
+            break;
         case 'workflow:error':
             progress.textContent = `Error: ${data.error || 'Unknown'}`;
             fill.style.width = '0%';

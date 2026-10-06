@@ -102,6 +102,22 @@ async def test_fill_waits_for_the_pumps_then_read_level_stores_the_level():
 
 
 @pytest.mark.asyncio
+async def test_pumping_publishes_the_level_for_the_3d_view():
+    bravo = _sim_bravo()
+    events = []
+
+    async def on_event(event):
+        events.append(event)
+
+    executor = WorkflowExecutor(bravo, _chain(_fill(pump_on_time_s=1.0)), on_event=on_event,
+                                preview_animation=False)
+    await executor.execute()
+    levels = [e["level_pct"] for e in events if e.get("type") == "workflow:autofill_level"]
+    assert all(e["location"] == STATION for e in events if e.get("type") == "workflow:autofill_level")
+    assert len(levels) >= 3 and levels[-1] > levels[0]
+
+
+@pytest.mark.asyncio
 async def test_weigh_station_stops_the_fill_at_the_stop_threshold():
     bravo = _sim_bravo()
     result = await bravo.pump_reagent(

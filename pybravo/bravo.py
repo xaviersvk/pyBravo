@@ -538,6 +538,9 @@ class Bravo:
     async def autofill_read_level(self, location: int) -> dict[str, Any]:
         return self.read_autofill_level(self._autofill_id_at(location))
 
+    def autofill_is_running(self, location: int) -> bool:
+        return bool(self._autofill_driver(self._autofill_id_at(location), require_enabled=False).is_running)
+
     async def read_barcode(self, location: int) -> dict[str, Any]:
         """Read the barcode of the plate at `location`.
 

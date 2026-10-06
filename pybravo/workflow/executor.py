@@ -23,6 +23,10 @@ from pybravo.tips import get_tip_length_mm
 
 logger = structlog.get_logger(__name__)
 
+# Background pollers sleep for real even when tests stub asyncio.sleep to speed
+# up UI pacing; a stubbed sleep would turn them into a busy loop.
+_real_sleep = asyncio.sleep
+
 
 # Sentinel for missing var lookups so callers can distinguish "key exists
 # with value None" from "key not present at all" (relevant for var:!NAME
@@ -451,6 +455,7 @@ class WorkflowExecutor:
         self._on_event = on_event
         self._aborted = False
         self._node_visits: dict[int, int] = {}  # node_id -> times reached (Pump Reagent "how often")
+        self._level_reporters: set[asyncio.Future] = set()  # autofill level publishers
         self._data_bus: dict[int, Any] = {}  # node_id -> output data value
         self._current_node_id: int | None = None
         self._tipbox_removed_cells: dict[str, set[str]] = {}
@@ -838,6 +843,39 @@ class WorkflowExecutor:
         """
         self._aborted = True
         self._stop_pumps_quietly()
+
+    def _start_level_reporter(self, location: int) -> None:
+        """Publish the autofill level at ``location`` while its pumps run.
+
+        Emits ``workflow:autofill_level`` events so the designer can show the
+        liquid rising and falling. Runs alongside the Pump Reagent step and, for
+        a concurrent one, after it, until the pumps stop.
+        """
+        is_running = getattr(self.bravo, "autofill_is_running", None)
+        if not callable(is_running):
+            return
+
+        async def report() -> None:
+            first = True
+            while True:
+                try:
+                    running = is_running(location)
+                    level = (await self.bravo.autofill_read_level(location)).get("level_pct")
+                except Exception:
+                    return
+                if level is not None:
+                    await self._emit({"type": "workflow:autofill_level", "location": location,
+                                      "level_pct": round(float(level), 1)})
+                # The first pass may run before the step starts the pumps;
+                # after that, the reading taken once they stop is the last one.
+                if not running and not first:
+                    return
+                first = False
+                await _real_sleep(0.3)
+
+        task = asyncio.ensure_future(report())
+        self._level_reporters.add(task)
+        task.add_done_callback(self._level_reporters.discard)
 
     def _stop_pumps_quietly(self) -> None:
         stop_all = getattr(self.bravo, "stop_all_pumps", None)
@@ -1477,6 +1515,8 @@ class WorkflowExecutor:
             how_often = max(1, int(properties.get("how_often", 1) or 1))
             if visit % how_often != 0:
                 method_name = None
+            else:
+                self._start_level_reporter(int(properties.get("location", 1)))
         if method_name:
             params = _build_task_params(node_type, properties)
             try:
