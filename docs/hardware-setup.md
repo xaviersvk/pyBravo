@@ -708,8 +708,8 @@ a stop, so every run is timed by the server, and pumps are also stopped on
 `POST /api/abort`, on disconnect, and whenever accessories are reconfigured.
 Keep the reservoir and waste lines in place before running pumps.
 
-The station is not yet used by workflows: filling or draining as a workflow
-step, or waiting for a weigh-pad level, is not implemented.
+In workflows, use the **Pump Reagent**, **Stop Pumps** and **Read Level** steps
+(see [Workflows → Accessories](workflows.md#accessories)).
 
 ---
 

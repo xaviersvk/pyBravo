@@ -171,6 +171,7 @@ class Bravo:
         self._tipbox_untracked: set[int] = set()
         self._labware_names: dict[str, int] = {}
         self._simulated_accessory_bus = None
+        self._pump_supervisors: set[asyncio.Future] = set()  # concurrent Pump Reagent steps
         self._accessories = AccessoryManager(self._profile, self._accessory_serial_sender)
 
     # -- Context manager --
@@ -426,6 +427,116 @@ class Bravo:
                     driver.stop_pumps()
                 except Exception:
                     logger.exception("Could not stop autofill pumps on %s", accessory_id)
+
+    # Workflow steps (accessory/PumpReagent, StopPumps, ReadLevel). Async like
+    # the other step methods so the workflow executor can await them. They
+    # address the station by deck location, the way plate steps do.
+
+    def _autofill_id_at(self, location: int) -> str:
+        for device in self._accessories.enabled_devices("autofill"):
+            if int(device.location or 0) == int(location):
+                return device.id
+        raise ValueError(f"No enabled autofill station at location {location}")
+
+    async def pump_reagent(
+        self,
+        location: int,
+        *,
+        reservoir_mode: str = "fill",
+        pump_speed_pct: float = 50.0,
+        pump_on_time_s: float = 5.0,
+        allow_concurrent: bool = False,
+        run_second_pump: bool = False,
+        second_pump_speed_pct: float = 50.0,
+        use_weigh_station: bool = False,
+        action_threshold_pct: float = 50.0,
+        stop_threshold_pct: float = 50.0,
+    ) -> dict[str, Any]:
+        """Fill or empty the autofill reservoir at ``location``.
+
+        ``reservoir_mode`` picks the pump that does the job ("fill" or "empty");
+        ``run_second_pump`` runs the other one at the same time (fill + drain =
+        a flowing reservoir). The pumps run for ``pump_on_time_s`` at most.
+
+        With ``use_weigh_station`` the level decides: Fill only acts when the
+        level is below ``action_threshold_pct`` and stops once it reaches
+        ``stop_threshold_pct``; Empty only acts above the action threshold and
+        stops once the level falls to the stop threshold.
+
+        With ``allow_concurrent`` the step returns as soon as the pumps start so
+        the next steps run alongside; otherwise it returns when they stop.
+        """
+        from pybravo.accessories.autofill import AutofillError
+
+        mode = str(reservoir_mode).strip().lower()
+        if mode not in ("fill", "empty"):
+            raise ValueError(f"reservoir_mode must be 'fill' or 'empty', not {reservoir_mode!r}")
+        accessory_id = self._autofill_id_at(location)
+        driver = self._autofill_driver(accessory_id)
+        filling = mode == "fill"
+
+        def level() -> float:
+            value = driver.read_level()["level_pct"]
+            if value is None:
+                raise ValueError(
+                    f"Autofill station at location {location} has no tare/range calibration; "
+                    "set them before using the weigh station"
+                )
+            return float(value)
+
+        def reached_stop(value: float) -> bool:
+            return value >= stop_threshold_pct if filling else value <= stop_threshold_pct
+
+        result: dict[str, Any] = {"location": location, "accessory_id": accessory_id, "mode": mode}
+        if use_weigh_station:
+            start_level = level()
+            result["start_level_pct"] = start_level
+            needs_action = start_level < action_threshold_pct if filling else start_level > action_threshold_pct
+            if not needs_action:
+                result["status"] = "skipped"
+                return result
+
+        speeds = {"fill_speed_pct": None, "empty_speed_pct": None}
+        speeds["fill_speed_pct" if filling else "empty_speed_pct"] = pump_speed_pct
+        if run_second_pump:
+            speeds["empty_speed_pct" if filling else "fill_speed_pct"] = second_pump_speed_pct
+        try:
+            driver.run_pumps(
+                pump_on_time_s,
+                fill=filling or run_second_pump,
+                empty=(not filling) or run_second_pump,
+                **speeds,
+            )
+        except AutofillError as exc:
+            raise ValueError(str(exc)) from exc
+
+        async def supervise() -> None:
+            # The driver's watchdog ends the run at pump_on_time_s; this only
+            # ends it earlier when the weigh pad says the job is done.
+            while driver.is_running:
+                if use_weigh_station and reached_stop(level()):
+                    driver.stop_pumps()
+                    break
+                await asyncio.sleep(0.25)
+
+        if allow_concurrent:
+            task = asyncio.ensure_future(supervise())
+            self._pump_supervisors.add(task)
+            task.add_done_callback(self._pump_supervisors.discard)
+            result["status"] = "running"
+            return result
+
+        await supervise()
+        result["status"] = "done"
+        if use_weigh_station:
+            result["end_level_pct"] = level()
+        return result
+
+    async def autofill_stop_pumps(self, location: int) -> dict[str, Any]:
+        return self.stop_autofill_pumps(self._autofill_id_at(location))
+
+    async def autofill_read_level(self, location: int) -> dict[str, Any]:
+        return self.read_autofill_level(self._autofill_id_at(location))
 
     async def read_barcode(self, location: int) -> dict[str, Any]:
         """Read the barcode of the plate at `location`.

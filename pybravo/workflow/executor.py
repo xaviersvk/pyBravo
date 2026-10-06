@@ -183,6 +183,9 @@ NODE_TYPE_MAP: dict[str, str] = {
     "plate/Relid": "relid_plate",
     "sensor/ReadBarcode": "read_barcode",
     "sensor/ScanStackHeight": "scan_stack_height",
+    "accessory/PumpReagent": "pump_reagent",
+    "accessory/StopPumps": "autofill_stop_pumps",
+    "accessory/ReadLevel": "autofill_read_level",
     "system/Initialize": "initialize",
     "system/Home": "home",
     "system/DockGripper": "dock_gripper",
@@ -328,6 +331,14 @@ def _build_task_params(node_type: str, properties: dict[str, Any]) -> dict[str, 
             params["blowout"] = float(properties["blowout"])
         if node_type == "liquid/Mix" and properties.get("cycles"):
             params["mix_cycles"] = int(properties["cycles"])
+        # Height above the well bottom. The designer has always saved it, but
+        # it was not passed on, so every step ran at the 1.0 mm default.
+        if properties.get("distance_from_bottom") not in (None, ""):
+            distance = float(properties["distance_from_bottom"])
+            if node_type == "liquid/Mix":
+                params["aspirate_distance"] = distance
+            else:
+                params["distance_from_bottom"] = distance
 
     elif node_type == "tips/TipsOn":
         params["location"] = int(properties.get("location", 1))
@@ -381,6 +392,19 @@ def _build_task_params(node_type: str, properties: dict[str, Any]) -> dict[str, 
                 except (TypeError, ValueError):
                     pass
 
+    elif node_type in ("accessory/PumpReagent", "accessory/StopPumps", "accessory/ReadLevel"):
+        params["location"] = int(properties.get("location", 1))
+        if node_type == "accessory/PumpReagent":
+            params["reservoir_mode"] = str(properties.get("reservoir_mode", "fill"))
+            params["pump_speed_pct"] = float(properties.get("pump_speed_pct", 50))
+            params["pump_on_time_s"] = float(properties.get("pump_on_time_s", 5))
+            params["allow_concurrent"] = bool(properties.get("allow_concurrent", False))
+            params["run_second_pump"] = bool(properties.get("run_second_pump", False))
+            params["second_pump_speed_pct"] = float(properties.get("second_pump_speed_pct", 50))
+            params["use_weigh_station"] = bool(properties.get("use_weigh_station", False))
+            params["action_threshold_pct"] = float(properties.get("action_threshold_pct", 50))
+            params["stop_threshold_pct"] = float(properties.get("stop_threshold_pct", 50))
+
     elif node_type == "system/Home":
         axes_str = properties.get("axes", "X,Y,Z,W,G,Zg")
         params["axes"] = [a.strip() for a in axes_str.split(",") if a.strip()]
@@ -426,6 +450,7 @@ class WorkflowExecutor:
                 }
         self._on_event = on_event
         self._aborted = False
+        self._node_visits: dict[int, int] = {}  # node_id -> times reached (Pump Reagent "how often")
         self._data_bus: dict[int, Any] = {}  # node_id -> output data value
         self._current_node_id: int | None = None
         self._tipbox_removed_cells: dict[str, set[str]] = {}
@@ -806,8 +831,21 @@ class WorkflowExecutor:
             logger.warning("Could not seed tip occupancy at location %d: %s", loc, exc)
 
     def abort(self) -> None:
-        """Request abort of the running workflow."""
+        """Request abort of the running workflow.
+
+        The walk stops at the next node; autofill pumps are stopped now, because
+        they run until told otherwise and a Run Pumps step may be waiting on them.
+        """
         self._aborted = True
+        self._stop_pumps_quietly()
+
+    def _stop_pumps_quietly(self) -> None:
+        stop_all = getattr(self.bravo, "stop_all_pumps", None)
+        if callable(stop_all):
+            try:
+                stop_all()
+            except Exception:
+                logger.exception("Could not stop autofill pumps")
 
     def resolve_script_error(self, action: str, new_source: str = "") -> bool:
         """Resolve a pending script-error pause.
@@ -1096,6 +1134,8 @@ class WorkflowExecutor:
             # non-workflow tasks.
             engine.set_step_handler(None)
             engine.set_error_handler(None)
+            # No pump outlives the workflow, however it ended.
+            self._stop_pumps_quietly()
 
         # Clean completion — green idle so the operator can tell the run
         # is done from across the room.
@@ -1430,6 +1470,13 @@ class WorkflowExecutor:
         # ── Task nodes ────────────────────────────────────────────────
         method_name = NODE_TYPE_MAP.get(node_type)
         result: Any = None
+        if node_type == "accessory/PumpReagent":
+            # "How often": act on the first pass, then on every Nth (in a loop).
+            visit = self._node_visits.get(node_id, 0)
+            self._node_visits[node_id] = visit + 1
+            how_often = max(1, int(properties.get("how_often", 1) or 1))
+            if visit % how_often != 0:
+                method_name = None
         if method_name:
             params = _build_task_params(node_type, properties)
             try:
@@ -1503,6 +1550,13 @@ class WorkflowExecutor:
                         store_as = str(properties.get("store_as", "") or "").strip()
                         if store_as:
                             self._vars[store_as] = height_val
+                            await self._emit_vars_update()
+                    elif node_type == "accessory/ReadLevel" and result:
+                        level_val = result.get("level_pct")
+                        self._data_bus[node_id] = level_val
+                        store_as = str(properties.get("store_as", "") or "").strip()
+                        if store_as:
+                            self._vars[store_as] = level_val
                             await self._emit_vars_update()
                 else:
                     logger.warning("Unknown bravo method", method=method_name)

@@ -176,6 +176,44 @@ Scan Stack Height treats a blank, zero or negative `expected_count` as "no
 expectation — just report what was measured". Any positive integer turns on
 validation, and a mismatch raises the operator prompt.
 
+### Accessories
+
+Steps for the autofill station (pump module and weigh pad, see
+[hardware setup](hardware-setup.md#autofill-station-pumps-and-weigh-pad)). They
+address the station by its deck `location`, like plate steps do.
+
+| Node | Operation | Key properties |
+|---|---|---|
+| Pump Reagent | `pump_reagent` | location, reservoir mode, pump speed, pump on time, how often, allow concurrent, second pump, weigh station thresholds |
+| Stop Pumps | `autofill_stop_pumps` | location |
+| Read Level | `autofill_read_level` | location, `store_as` |
+
+**Pump Reagent** fills or empties the reservoir:
+
+- **Pump.** `reservoir_mode` (Fill / Empty) picks the pump that does the job.
+  It runs at `pump_speed_pct` for up to `pump_on_time_s` (1–600 s).
+- **Second pump.** `run_second_pump` runs the other pump as well, at
+  `second_pump_speed_pct`. Fill plus drain gives a flowing reservoir.
+- **Concurrent.** By default the step waits until the pumps stop. With
+  `allow_concurrent` it returns at once, so the next steps run while it pumps.
+- **How often.** `how_often` = N acts on the first pass and then on every Nth
+  one, which is useful inside a Loop.
+- **Weigh station.** With `use_weigh_station`, Fill only acts while the level
+  is below `action_threshold_pct` and stops once it reaches
+  `stop_threshold_pct`. Empty works the other way round. The station needs its
+  tare and range set.
+
+A tip wash is a Loop around three steps: Pump Reagent (Fill), a Mix at the
+station's location as if it were a plate, and Pump Reagent (Empty). To change
+the water while mixing instead, use one Pump Reagent with
+`run_second_pump` and `allow_concurrent` before the Mix.
+
+Pumps never outlive the workflow: stopping a workflow, or reaching its end
+however it ended, stops every autofill pump.
+
+Read Level publishes the level (in %) on its data output; `store_as` writes it
+to the blackboard.
+
 ### System
 
 | Node | Operation |
