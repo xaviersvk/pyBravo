@@ -195,12 +195,16 @@ _NODE_CATALOG: tuple[tuple[str, dict[str, Any]], ...] = (
             "the next steps run while it pumps. `how_often`=N acts on the "
             "first pass and every Nth one. With `use_weigh_station`, fill acts "
             "only below `action_threshold_pct` and stops at "
-            "`stop_threshold_pct` (empty: above / down to)."
+            "`stop_threshold_pct` (empty: above / down to). "
+            "`reservoir_mode` \"hold\" keeps liquid flowing for "
+            "`pump_on_time_s` at `target_level_pct`: inflow at "
+            "`pump_speed_pct`, the weigh pad steers the drain."
         ),
         "required": ("location",),
         "optional": ("reservoir_mode", "pump_speed_pct", "pump_on_time_s", "how_often",
                      "allow_concurrent", "run_second_pump", "second_pump_speed_pct",
-                     "use_weigh_station", "action_threshold_pct", "stop_threshold_pct"),
+                     "use_weigh_station", "action_threshold_pct", "stop_threshold_pct",
+                     "target_level_pct"),
     }),
     ("accessory/StopPumps", {
         "desc": "Stop all pumps of the autofill station at `location`.",

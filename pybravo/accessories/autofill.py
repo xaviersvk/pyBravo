@@ -115,10 +115,21 @@ class AutofillStation:
         self._running = False
         self._run_token = 0
         self._stop_at: float | None = None
+        self._speeds: dict[str, float] = {}  # pump role -> last commanded speed while running
 
     @property
     def config(self) -> AutofillConfig:
         return self._config
+
+    @property
+    def run_token(self) -> int:
+        """Changes on every start and stop; lets a supervisor tell its own run from a later one."""
+        return self._run_token
+
+    @property
+    def pump_speeds(self) -> dict[str, float]:
+        """Speed (%) last commanded to each running pump: {"fill": .., "empty": ..}."""
+        return dict(self._speeds) if self._running else {}
 
     @property
     def is_open(self) -> bool:
@@ -170,14 +181,15 @@ class AutofillStation:
             raise AutofillError(f"Pump run time must be from 0 to {self._config.max_run_s:g} s")
 
         commands = []
+        speeds: dict[str, float] = {}
         if fill:
             p = self._config.fill
-            commands.append(("fill", build_run_pump(
-                p.module, p.pump, p.direction, p.speed_pct if fill_speed_pct is None else fill_speed_pct)))
+            speeds["fill"] = p.speed_pct if fill_speed_pct is None else fill_speed_pct
+            commands.append(("fill", build_run_pump(p.module, p.pump, p.direction, speeds["fill"])))
         if empty:
             p = self._config.empty
-            commands.append(("empty", build_run_pump(
-                p.module, p.pump, p.direction, p.speed_pct if empty_speed_pct is None else empty_speed_pct)))
+            speeds["empty"] = p.speed_pct if empty_speed_pct is None else empty_speed_pct
+            commands.append(("empty", build_run_pump(p.module, p.pump, p.direction, speeds["empty"])))
 
         with self._lock:
             if self._running:
@@ -185,6 +197,7 @@ class AutofillStation:
             self._run_token += 1
             token = self._run_token
             self._running = True
+            self._speeds = speeds
             self._stop_at = time.monotonic() + duration_s
             try:
                 for label, payload in commands:
@@ -200,6 +213,24 @@ class AutofillStation:
         logger.info(
             "Autofill pumps running for %.1f s (fill=%s, empty=%s)", duration_s, fill, empty
         )
+
+    def set_pump_speed(self, role: str, speed_pct: float, *, run_token: int | None = None) -> None:
+        """Change the speed of the running fill or empty pump.
+
+        Re-sends the run command for that pump with the new speed; the run's
+        deadline and watchdog are unchanged. Speed 0 keeps the pump commanded
+        but still. Does nothing once the run has ended, or, with ``run_token``,
+        when that run has been stopped or replaced by another one.
+        """
+        settings = {"fill": self._config.fill, "empty": self._config.empty}.get(role)
+        if settings is None:
+            raise AutofillError(f"Unknown pump role {role!r}; use 'fill' or 'empty'")
+        payload = build_run_pump(settings.module, settings.pump, settings.direction, speed_pct)
+        with self._lock:
+            if not self._running or (run_token is not None and run_token != self._run_token):
+                return
+            self._send(payload, f"set {role} pump speed")
+            self._speeds[role] = float(speed_pct)
 
     def stop_pumps(self) -> None:
         """Stop every pump on the module. Sent twice, as the stop is not acknowledged by state."""
@@ -275,6 +306,195 @@ class AutofillStation:
         if reply[1] != 0:
             raise AutofillError(f"Autofill {label}: module reported status 0x{reply[1]:02X}")
         return reply
+
+
+PRIME_MIN_LEVEL_PCT = 5.0  # never prime the drain from an (almost) empty tray
+FILL_PRIMED_RISE_PCT = 1.5  # level rise (above weigh-pad ripple) that shows the supply delivers
+DRAIN_PRIME_TIMEOUT_S = 8.0  # a dry drain line took several seconds even at 100 %
+DRAIN_PRIMED_SLOPE_PCT_S = 1.5  # level falling at least this fast: the drain pulls
+INTEGRAL_UNWIND_GAIN = 3.0
+
+
+class LevelHoldController:
+    """Hold the reservoir at a target level while liquid flows through it.
+
+    Deliberately simple and smooth:
+
+    * The working target (``target``) moves continuously toward the requested
+      target (``requested_target``) at ``target_ramp_pct_s``; it starts at the
+      current level, so the tray is brought up (or down) along a ramp rather
+      than in one jump.
+    * The drain follows a PI controller around "drain = inflow".
+    * The inflow runs at the requested value while the drain has headroom and
+      is scaled down continuously as the drain nears its limit (full inflow at
+      ``throttle_from_pct`` drain, none at 100 %), so a drain that cannot keep
+      up never lets the tray overflow and nothing switches on and off.
+    * Pump speeds never jump: both move at most ``max_speed_change_pct_s``.
+      The one exception is priming: once the level gets within
+      ``prime_before_target_pct`` of the target the drain runs at full speed
+      until the level clearly falls (at least ``prime_s``), as a drain line
+      that ran dry does not pull at low speed.
+      Likewise the inflow starts at full speed until the level rises
+      (``prime_fill``), as the supply line drains back while idle.
+
+    Target and inflow can be changed while it runs (:meth:`set_target`,
+    :meth:`set_inflow`).
+    """
+
+    def __init__(
+        self,
+        target_pct: float,
+        inflow_pct: float,
+        *,
+        # Defaults tuned against the 384ST autofill station (2026-10-06): fill
+        # ~0.094 %/s per % speed with ~0.6 s dead time, drain ~0.10-0.13 %/s
+        # per % with ~1 s dead time, weigh-pad ripple about +-0.7 %. A drain
+        # line that ran dry does not prime below ~50 % speed but does within
+        # ~1 s at 100 %, hence the priming pulse.
+        kp: float = 1.5,
+        ki: float = 0.2,
+        target_ramp_pct_s: float = 15.0,
+        throttle_from_pct: float = 85.0,
+        max_speed_change_pct_s: float = 20.0,
+        inflow_change_pct_s: float = 10.0,
+        lookahead_s: float = 1.0,
+        level_smoothing: float = 1.0,
+        slope_smoothing: float = 0.15,
+        prime_s: float = 1.5,
+        prime_before_target_pct: float = 15.0,
+        integral_limit_pct: float = 60.0,
+        prime_fill: bool = True,
+        fill_prime_timeout_s: float = 20.0,
+    ) -> None:
+        # The supply line drains back to the source while idle and, like the
+        # drain, does not lift water at low speed: start the inflow at full
+        # speed until the level actually rises, then drop to the request.
+        self._fill_priming = prime_fill
+        self._fill_prime_left = fill_prime_timeout_s
+        self._start_level: float | None = None
+        self._prime_s = prime_s
+        self._prime_lead = prime_before_target_pct
+        self._priming_left = 0.0
+        self._priming_min = 0.0
+        self._primed = prime_s <= 0
+        self._integral_limit = integral_limit_pct
+        self._inflow_rate = inflow_change_pct_s
+        self._level_alpha = level_smoothing  # 1.0 = raw reading; lower = calmer, slower
+        self._slope_alpha = slope_smoothing
+        self._smoothed: float | None = None
+        self.requested_target = target_pct
+        self.target = target_pct  # working target; starts at the level on first update
+        self.requested_inflow = inflow_pct
+        self.inflow = inflow_pct
+        # The drain starts closed and only opens (ramping) when the level calls
+        # for it, so a hold that begins below its target never drains first.
+        self.drain = 0.0
+        self.inflow_limit: float | None = None  # set while the drain is throttling the inflow
+        self._kp, self._ki = kp, ki
+        self._target_ramp = target_ramp_pct_s
+        self._throttle_from = throttle_from_pct
+        self._max_rate = max_speed_change_pct_s
+        self._integral = 0.0
+        self._started = False
+        self._lookahead = lookahead_s
+        self._last_level: float | None = None
+        self._slope = 0.0  # smoothed level change, %/s
+
+    def set_target(self, target_pct: float) -> None:
+        self.requested_target = float(target_pct)
+
+    def set_inflow(self, inflow_pct: float) -> None:
+        self.requested_inflow = min(100.0, max(0.0, float(inflow_pct)))
+
+    def _ramp(self, current: float, wanted: float, rate: float, dt_s: float) -> float:
+        limit = rate * dt_s
+        return current + max(-limit, min(limit, wanted - current))
+
+    def update(self, level_pct: float, dt_s: float) -> tuple[float, float]:
+        """Return (inflow %, drain %) for the next interval."""
+        if not self._started:
+            self._started = True
+            self.target = level_pct
+        self.target = self._ramp(self.target, self.requested_target, self._target_ramp, dt_s)
+
+        # The weigh pad reads with ripple from the pumps; smooth it before use.
+        if self._smoothed is None:
+            self._smoothed = level_pct
+        self._smoothed += self._level_alpha * (level_pct - self._smoothed)
+        level_pct = self._smoothed
+
+        # The level a moment ahead (smoothed rate, so weigh-pad noise stays out).
+        if self._last_level is not None and dt_s > 0:
+            measured = (level_pct - self._last_level) / dt_s
+            self._slope += self._slope_alpha * (measured - self._slope)
+        self._last_level = level_pct
+        error = level_pct + self._slope * self._lookahead - self.target  # positive: too full
+
+        # Inflow: the request, scaled down smoothly as the drain nears its limit
+        # and while the level is heading over the target.
+        drain_load = 0.0 if self.priming else self.drain  # a priming pulse is not a drain at its limit
+        headroom = (100.0 - drain_load) / (100.0 - self._throttle_from)
+        heading_over = 1.0 - max(0.0, error) / 10.0
+        goal = self.requested_inflow * min(1.0, max(0.0, headroom), max(0.0, heading_over))
+        self.inflow_limit = goal if goal < self.requested_inflow - 0.5 else None
+        if self._start_level is None:
+            self._start_level = level_pct
+        if self._fill_priming:
+            self._fill_prime_left -= dt_s
+            if (level_pct >= self._start_level + FILL_PRIMED_RISE_PCT or self._fill_prime_left <= 0
+                    or self.requested_inflow <= 0 or level_pct >= self.target):
+                self._fill_priming = False
+                self.inflow = min(self.inflow, goal)  # primed: straight to the request
+            else:
+                self.inflow = 100.0
+        if not self._fill_priming:
+            # The inflow is the slow loop and the drain the fast one, so the
+            # two never chase each other.
+            self.inflow = self._ramp(self.inflow, goal, self._inflow_rate, dt_s)
+
+        # Drain: PI around "drain = inflow". Well below the target the
+        # "drain = inflow" share fades out, so the drain stays closed while filling.
+        share = min(1.0, max(0.0, 1.0 + error / 5.0))
+        unclamped = share * self.inflow + self._kp * error + self._ki * self._integral
+        wanted = min(100.0, max(0.0, unclamped))
+
+        # Prime the drain once, a little before the target, with one short
+        # full-speed pulse: an empty drain line does not pull at low speed.
+        # Prime the drain once, a little before the target: full speed until
+        # the level clearly falls (at least prime_s, at most
+        # DRAIN_PRIME_TIMEOUT_S), as an empty drain line does not pull at low speed.
+        prime_from = max(PRIME_MIN_LEVEL_PCT, self.requested_target - self._prime_lead)
+        if not self._primed and level_pct >= prime_from:
+            self._primed = True
+            self._priming_left = DRAIN_PRIME_TIMEOUT_S
+            self._priming_min = self._prime_s
+        if self._priming_left > 1e-9:
+            self._priming_left -= dt_s
+            self._priming_min -= dt_s
+            pulling = self._priming_min <= 1e-9 and self._slope <= -DRAIN_PRIMED_SLOPE_PCT_S
+            if pulling or self._priming_left <= 1e-9:
+                self._priming_left = 0.0
+                self.drain = 0.0  # primed: the drain ramps up from closed again
+                return self.inflow, 100.0
+            self.drain = 100.0
+            return self.inflow, self.drain
+
+        if wanted == unclamped and self._ki > 0:
+            # No wind-up while saturated, never more than integral_limit_pct of
+            # drain speed, and unwinding faster than it winds up, so a slow
+            # start cannot leave a lasting offset.
+            step = error * dt_s
+            if step * self._integral < 0:
+                step *= INTEGRAL_UNWIND_GAIN
+            bound = self._integral_limit / self._ki
+            self._integral = min(bound, max(-bound, self._integral + step))
+        self.drain = self._ramp(self.drain, wanted, self._max_rate, dt_s)
+        return self.inflow, self.drain
+
+    @property
+    def priming(self) -> bool:
+        """True while the drain-priming pulse is running."""
+        return self._priming_left > 1e-9
 
 
 class SimulatedAutofillModule:

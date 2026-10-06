@@ -184,7 +184,7 @@ address the station by its deck `location`, like plate steps do.
 
 | Node | Operation | Key properties |
 |---|---|---|
-| Pump Reagent | `pump_reagent` | location, reservoir mode, pump speed, pump on time, how often, allow concurrent, second pump, weigh station thresholds |
+| Pump Reagent | `pump_reagent` | location, reservoir mode (Fill / Empty / Hold level), pump speed, pump on time, how often, allow concurrent, second pump, weigh station thresholds, hold target level |
 | Stop Pumps | `autofill_stop_pumps` | location |
 | Read Level | `autofill_read_level` | location, `store_as` |
 
@@ -202,6 +202,14 @@ address the station by its deck `location`, like plate steps do.
   is below `action_threshold_pct` and stops once it reaches
   `stop_threshold_pct`. Empty works the other way round. The station needs its
   tare and range set.
+- **Hold level.** `reservoir_mode` "hold" keeps liquid flowing through the
+  tray for `pump_on_time_s` while holding it at `target_level_pct`. The fill
+  pump runs at `pump_speed_pct` and the weigh pad steers the drain pump. The
+  working target ramps from the current level to the requested one, both
+  lines are primed at 100 % first (supply until the level rises, drain near
+  the target until the level falls), and the inflow is throttled when the
+  drain cannot keep up. The pumps stop if the tray reaches 100 %. Hold always
+  uses the weigh station, so it needs tare and range set.
 
 A tip wash is a Loop around three steps: Pump Reagent (Fill), a Mix at the
 station's location as if it were a plate, and Pump Reagent (Empty). To change

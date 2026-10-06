@@ -591,6 +591,12 @@
         }
         .accessory-type-panel { display: none; }
         .accessory-type-panel.active { display: block; }
+        .autofill-chart { position: relative; }
+        .autofill-chart canvas { display: block; width: 100%; height: 170px; }
+        .autofill-chart-legend { display: flex; flex-wrap: wrap; gap: 10px; font-size: 10px; color: var(--text-dim); margin-bottom: 4px; }
+        .autofill-chart-legend .swatch { display: inline-block; width: 12px; height: 2px; vertical-align: middle; margin-right: 4px; }
+        .autofill-chart-tip { position: absolute; pointer-events: none; font-size: 10px; padding: 4px 6px; border-radius: 4px;
+            background: var(--bg-card, #222); border: 1px solid var(--border); color: var(--text); white-space: nowrap; display: none; }
 
         .process-selector-card {
             border: 1px solid var(--border);
@@ -1411,10 +1417,20 @@
                             <div class="checkbox-row"><input type="checkbox" id="accessory-autofill-run-fill" checked><label for="accessory-autofill-run-fill">Fill</label></div>
                             <div class="checkbox-row"><input type="checkbox" id="accessory-autofill-run-empty" checked><label for="accessory-autofill-run-empty">Empty</label></div>
                         </div>
+                        <div class="form-row"><label>Hold level</label>
+                            <input type="number" id="accessory-autofill-hold-target" value="75" min="0" max="99" style="width:60px"><span class="text-xs text-dim">% at inflow</span>
+                            <input type="number" id="accessory-autofill-hold-inflow" value="50" min="0" max="100" style="width:60px"><span class="text-xs text-dim">%</span>
+                            <button class="btn btn-sm" id="btn-accessory-autofill-hold" title="Fill and drain together for the run time; the weigh pad steers the drain to hold the level. Stops at 100 %.">Hold</button>
+                        </div>
                         <div class="btn-group mt-8">
                             <button class="btn btn-sm btn-primary" id="btn-accessory-autofill-run">Run pumps</button>
                             <button class="btn btn-sm btn-danger" id="btn-accessory-autofill-stop">Stop pumps</button>
                             <span class="value text-xs" id="accessory-autofill-status">-</span>
+                        </div>
+                        <div class="autofill-chart mt-8">
+                            <div class="autofill-chart-legend" id="accessory-autofill-chart-legend"></div>
+                            <canvas id="accessory-autofill-chart" height="170" aria-label="Fill level and pump speeds over the last 120 seconds" role="img"></canvas>
+                            <div class="text-xs text-dim" id="accessory-autofill-chart-note">Last 120 s · updates while Live or pumps run</div>
                         </div>
                     </div>
 

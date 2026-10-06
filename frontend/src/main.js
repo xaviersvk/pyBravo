@@ -5040,7 +5040,10 @@ function renderAutofillReading(reading) {
     const range = parseFloat(document.getElementById('prof-accessory-autofill-range')?.value || '0');
     const level = reading == null || range === tare ? null : ((reading - tare) * 100) / (range - tare);
     if (levelEl) levelEl.textContent = level == null ? '-' : level.toFixed(2);
-    if (level != null) setAutofillVisualLevel(selectedAutofill()?.id, level);
+    if (level != null) {
+        setAutofillVisualLevel(selectedAutofill()?.id, level);
+        recordAutofillSample(level);
+    }
 }
 
 async function readAutofillWeight() {
@@ -5076,12 +5079,31 @@ function watchAutofillRun(accessoryId) {
         if (!runtime || !runtime.is_running) {
             window.clearInterval(autofillStatusTimer);
             autofillStatusTimer = null;
+            autofillHoldAccessoryId = null;
+            autofillLastSpeeds = {};
+            autofillLastTarget = null;
             setAutofillStatus('stopped');
             void readAutofillWeight(); // settle the level shown after the stop
             return;
         }
         const left = runtime.seconds_remaining;
-        setAutofillStatus(left == null ? 'running' : `running, ${left.toFixed(1)} s left`);
+        const timeText = left == null ? '' : `, ${left.toFixed(1)} s left`;
+        const hold = runtime.hold;
+        autofillHoldAccessoryId = hold ? accessoryId : null;
+        // Speeds actually commanded to the pumps right now.
+        const speeds = runtime.pump_speeds || {};
+        autofillLastSpeeds = speeds;
+        autofillLastTarget = hold ? (hold.step_target_pct ?? hold.target_level_pct) : null;
+        const speedText = ['fill', 'empty']
+            .filter(role => speeds[role] != null)
+            .map(role => `${role} ${Math.round(speeds[role])} %`)
+            .join(' · ');
+        const limited = hold && hold.inflow_limit_pct != null
+            ? ` · inflow limited to ${Math.round(hold.inflow_limit_pct)} % (drain can't keep up)` : '';
+        const stepping = hold && hold.step_target_pct != null && hold.step_target_pct !== hold.target_level_pct
+            ? ` (step ${Math.round(hold.step_target_pct)} %)` : '';
+        const what = hold ? `holding ${hold.target_level_pct} %${stepping}${limited}` : 'running';
+        setAutofillStatus(`${what}${speedText ? ` · ${speedText}` : ''}${timeText}`);
         // Follow the liquid in the 3D view while pumping, even without Live.
         if (!autofillLiveTimer) void readAutofillWeight();
     }, 500);
@@ -5127,6 +5149,238 @@ async function runSelectedAutofill() {
     }
     log(`Autofill pumps running for ${duration} s`, 'success');
     watchAutofillRun(current.id);
+}
+
+async function holdSelectedAutofill() {
+    const device = selectedAutofill();
+    if (!device) {
+        log('Select an Autofill Station accessory first', 'error');
+        return;
+    }
+    const duration = parseFloat(document.getElementById('accessory-autofill-duration')?.value || '0');
+    const target = parseFloat(document.getElementById('accessory-autofill-hold-target')?.value || '');
+    const inflow = parseFloat(document.getElementById('accessory-autofill-hold-inflow')?.value || '');
+    if (!(duration > 0 && duration <= 600) || !Number.isFinite(target) || !Number.isFinite(inflow)) {
+        log('Set the run time (1-600 s), target level and inflow first', 'error');
+        return;
+    }
+    setAutofillStatus('starting hold...');
+    if (!await syncAccessoriesToBackend()) {
+        setAutofillStatus('sync failed');
+        return;
+    }
+    const current = selectedAutofill() || device;
+    const res = await apiCall(`/api/accessories/${encodeURIComponent(current.id)}/autofill/hold`, 'POST', {
+        target_level_pct: target, inflow_pct: inflow, duration_s: duration,
+    });
+    if (!res) {
+        setAutofillStatus('error');
+        return;
+    }
+    log(`Holding ${target} % at ${inflow} % inflow for ${duration} s`, 'success');
+    autofillHoldAccessoryId = current.id;
+    setAutofillLive(true);
+    watchAutofillRun(current.id);
+}
+
+// ── Autofill live chart: level and pump speeds over the last 120 s ──
+// One 0-100 % axis carries both, since level and pump speed are both percent.
+// Series colours: categorical slots 1-3 of the validated chart palette, in order.
+const AUTOFILL_CHART_WINDOW_S = 120;
+const AUTOFILL_SERIES = [
+    { key: 'level', label: 'Level', light: '#2a78d6', dark: '#3987e5' },
+    { key: 'fill', label: 'Fill pump', light: '#eb6834', dark: '#d95926' },
+    { key: 'empty', label: 'Empty pump', light: '#1baf7a', dark: '#199e70' },
+];
+const autofillSamples = []; // { t, level, fill, empty, target }
+let autofillLastSpeeds = {};
+let autofillLastTarget = null;
+let autofillChartHoverX = null;
+
+function autofillChartColors() {
+    const dark = (document.documentElement.dataset.theme || 'dark') !== 'light';
+    const css = getComputedStyle(document.documentElement);
+    return {
+        dark,
+        text: css.getPropertyValue('--text-dim').trim() || (dark ? '#c3c2b7' : '#52514e'),
+        grid: dark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.08)',
+        target: dark ? '#c3c2b7' : '#52514e',
+        surface: css.getPropertyValue('--bg-panel').trim() || (dark ? '#1a1a19' : '#fcfcfb'),
+    };
+}
+
+function recordAutofillSample(levelPct) {
+    const now = performance.now() / 1000;
+    autofillSamples.push({
+        t: now,
+        level: levelPct,
+        fill: autofillLastSpeeds.fill ?? null,
+        empty: autofillLastSpeeds.empty ?? null,
+        target: autofillLastTarget,
+    });
+    while (autofillSamples.length && now - autofillSamples[0].t > AUTOFILL_CHART_WINDOW_S) autofillSamples.shift();
+    drawAutofillChart();
+}
+
+function renderAutofillChartLegend() {
+    const el = document.getElementById('accessory-autofill-chart-legend');
+    if (!el || el.childElementCount) return;
+    const colors = autofillChartColors();
+    for (const s of AUTOFILL_SERIES) {
+        const item = document.createElement('span');
+        const sw = document.createElement('span');
+        sw.className = 'swatch';
+        sw.style.background = colors.dark ? s.dark : s.light;
+        item.append(sw, s.label);
+        el.appendChild(item);
+    }
+    const item = document.createElement('span');
+    const sw = document.createElement('span');
+    sw.className = 'swatch';
+    sw.style.background = `repeating-linear-gradient(90deg, ${colors.target} 0 3px, transparent 3px 5px)`;
+    item.append(sw, 'Hold target');
+    el.appendChild(item);
+}
+
+function drawAutofillChart() {
+    const canvas = document.getElementById('accessory-autofill-chart');
+    if (!canvas || !canvas.offsetParent) return; // panel hidden
+    renderAutofillChartLegend();
+    const dpr = window.devicePixelRatio || 1;
+    const cssW = canvas.clientWidth;
+    const cssH = canvas.clientHeight;
+    if (canvas.width !== Math.round(cssW * dpr)) canvas.width = Math.round(cssW * dpr);
+    if (canvas.height !== Math.round(cssH * dpr)) canvas.height = Math.round(cssH * dpr);
+    const ctx = canvas.getContext('2d');
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, cssW, cssH);
+    const colors = autofillChartColors();
+    const pad = { l: 30, r: 40, t: 6, b: 16 };
+    const w = cssW - pad.l - pad.r;
+    const h = cssH - pad.t - pad.b;
+    const now = performance.now() / 1000;
+    const x = t => pad.l + w * (1 - (now - t) / AUTOFILL_CHART_WINDOW_S);
+    const y = v => pad.t + h * (1 - Math.max(0, Math.min(110, v)) / 110);
+
+    // Recessive grid and axis labels.
+    ctx.font = '10px sans-serif';
+    ctx.fillStyle = colors.text;
+    ctx.strokeStyle = colors.grid;
+    ctx.lineWidth = 1;
+    for (const v of [0, 25, 50, 75, 100]) {
+        ctx.beginPath();
+        ctx.moveTo(pad.l, y(v) + 0.5);
+        ctx.lineTo(pad.l + w, y(v) + 0.5);
+        ctx.stroke();
+        ctx.textAlign = 'right';
+        ctx.fillText(`${v}%`, pad.l - 4, y(v) + 3);
+    }
+    ctx.textAlign = 'center';
+    for (const s of [120, 90, 60, 30, 0]) ctx.fillText(s ? `-${s}s` : 'now', pad.l + w * (1 - s / AUTOFILL_CHART_WINDOW_S), cssH - 3);
+
+    const line = (key, color, dashed = false) => {
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 2;
+        ctx.setLineDash(dashed ? [4, 3] : []);
+        ctx.beginPath();
+        let drawing = false;
+        for (const p of autofillSamples) {
+            const v = p[key];
+            if (v == null || !Number.isFinite(v)) { drawing = false; continue; }
+            if (drawing) ctx.lineTo(x(p.t), y(v));
+            else { ctx.moveTo(x(p.t), y(v)); drawing = true; }
+        }
+        ctx.stroke();
+        ctx.setLineDash([]);
+    };
+    line('target', colors.target, true);
+    const ends = [];
+    for (const s of AUTOFILL_SERIES) {
+        const color = colors.dark ? s.dark : s.light;
+        line(s.key, color);
+        const last = [...autofillSamples].reverse().find(p => p[s.key] != null);
+        if (last) ends.push({ y: y(last[s.key]), text: `${Math.round(last[s.key])}%`, color });
+    }
+    // Direct end labels: a coloured dot beside text in text colour, nudged apart.
+    ends.sort((a, b) => a.y - b.y);
+    for (let i = 1; i < ends.length; i++) ends[i].y = Math.max(ends[i].y, ends[i - 1].y + 11);
+    ctx.textAlign = 'left';
+    for (const e of ends) {
+        ctx.fillStyle = e.color;
+        ctx.beginPath();
+        ctx.arc(pad.l + w + 6, e.y, 3, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = colors.text;
+        ctx.fillText(e.text, pad.l + w + 12, e.y + 3);
+    }
+
+    // Hover crosshair + tooltip.
+    const tip = document.getElementById('accessory-autofill-chart-tip');
+    if (autofillChartHoverX == null || !autofillSamples.length) {
+        if (tip) tip.style.display = 'none';
+        return;
+    }
+    const tHover = now - (1 - (autofillChartHoverX - pad.l) / w) * AUTOFILL_CHART_WINDOW_S;
+    const nearest = autofillSamples.reduce((a, b) => (Math.abs(b.t - tHover) < Math.abs(a.t - tHover) ? b : a));
+    const hx = x(nearest.t);
+    ctx.strokeStyle = colors.text;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(hx + 0.5, pad.t);
+    ctx.lineTo(hx + 0.5, pad.t + h);
+    ctx.stroke();
+    if (tip) {
+        const fmt = v => (v == null ? '–' : `${Math.round(v * 10) / 10} %`);
+        tip.textContent = `${Math.round(now - nearest.t)} s ago · level ${fmt(nearest.level)} · fill ${fmt(nearest.fill)} · empty ${fmt(nearest.empty)}`
+            + (nearest.target != null ? ` · target ${nearest.target} %` : '');
+        tip.style.display = 'block';
+        tip.style.left = `${Math.min(Math.max(0, hx - 80), cssW - 220)}px`;
+        tip.style.top = '18px';
+    }
+}
+
+(() => {
+    const canvas = document.getElementById('accessory-autofill-chart');
+    if (!canvas) return;
+    const tip = document.createElement('div');
+    tip.id = 'accessory-autofill-chart-tip';
+    tip.className = 'autofill-chart-tip';
+    canvas.parentElement.appendChild(tip);
+    canvas.addEventListener('mousemove', (event) => {
+        autofillChartHoverX = event.offsetX;
+        drawAutofillChart();
+    });
+    canvas.addEventListener('mouseleave', () => {
+        autofillChartHoverX = null;
+        drawAutofillChart();
+    });
+    // Keep the time axis sliding even between samples.
+    window.setInterval(() => { if (autofillSamples.length) drawAutofillChart(); }, 1000);
+})();
+
+// While a Hold level runs, edits to its target and inflow go straight to the
+// running regulator; the pumps ramp to the new values.
+let autofillHoldAccessoryId = null;
+
+async function pushAutofillHoldChange() {
+    if (!autofillHoldAccessoryId) return;
+    const target = parseFloat(document.getElementById('accessory-autofill-hold-target')?.value || '');
+    const inflow = parseFloat(document.getElementById('accessory-autofill-hold-inflow')?.value || '');
+    if (!Number.isFinite(target) || !Number.isFinite(inflow)) return;
+    const res = await apiCall(
+        `/api/accessories/${encodeURIComponent(autofillHoldAccessoryId)}/autofill/hold/update`, 'POST',
+        { target_level_pct: target, inflow_pct: inflow },
+    );
+    if (res) log(`Hold changed: ${res.target_level_pct} % at ${res.inflow_pct} % inflow`, 'info');
+}
+
+// Send once the operator has settled on a value, not on every arrow click.
+let autofillHoldChangeTimer = null;
+for (const id of ['accessory-autofill-hold-target', 'accessory-autofill-hold-inflow']) {
+    document.getElementById(id)?.addEventListener('input', () => {
+        if (autofillHoldChangeTimer) window.clearTimeout(autofillHoldChangeTimer);
+        autofillHoldChangeTimer = window.setTimeout(() => { void pushAutofillHoldChange(); }, 400);
+    });
 }
 
 async function stopSelectedAutofill() {
@@ -5370,6 +5624,7 @@ for (const id of ['prof-accessory-autofill-tare', 'prof-accessory-autofill-range
 }
 document.getElementById('btn-accessory-autofill-run')?.addEventListener('click', () => { void runSelectedAutofill(); });
 document.getElementById('btn-accessory-autofill-stop')?.addEventListener('click', () => { void stopSelectedAutofill(); });
+document.getElementById('btn-accessory-autofill-hold')?.addEventListener('click', () => { void holdSelectedAutofill(); });
 
 document.getElementById('btn-accessory-teleshake-start')?.addEventListener('click', async () => {
     await runSelectedTeleshakeAction('start');

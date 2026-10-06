@@ -3282,8 +3282,13 @@ function registerNodeTypes() {
             if (this.properties.volume) parts.push(`${this.properties.volume}\u03BCL`);
             if (this.properties.cycles) parts.push(`\u00D7${this.properties.cycles}`);
             if (this.type === 'accessory/PumpReagent') {
-                const mode = this.properties.reservoir_mode === 'empty' ? 'Empty' : 'Fill';
-                parts.push(`${mode}${this.properties.run_second_pump ? '+2nd' : ''} ${this.properties.pump_on_time_s}s`);
+                const rm = this.properties.reservoir_mode;
+                if (rm === 'hold') {
+                    parts.push(`Hold ${this.properties.target_level_pct}% ${this.properties.pump_on_time_s}s`);
+                } else {
+                    const mode = rm === 'empty' ? 'Empty' : 'Fill';
+                    parts.push(`${mode}${this.properties.run_second_pump ? '+2nd' : ''} ${this.properties.pump_on_time_s}s`);
+                }
                 if (this.properties.allow_concurrent) parts.push('concurrent');
                 if (Number(this.properties.how_often) > 1) parts.push(`every ${this.properties.how_often}`);
             }
@@ -3393,7 +3398,9 @@ function registerNodeTypes() {
     // run_second_pump runs the other pump too (fill + drain = flowing).
     // how_often=N acts on the first pass and every Nth one in a loop. With
     // use_weigh_station, Fill acts only below action_threshold_pct and stops
-    // at stop_threshold_pct (Empty: above / down to). The server stops the
+    // at stop_threshold_pct (Empty: above / down to). Hold level keeps
+    // liquid flowing for pump_on_time_s at target_level_pct: inflow at
+    // pump_speed_pct, the weigh pad steers the drain. The server stops the
     // pumps after pump_on_time_s, on Stop and when the workflow ends.
     makeTaskNode('Pump Reagent', 'accessory', 'accessory', {
         location: 1, reservoir_mode: 'fill',
@@ -3401,6 +3408,7 @@ function registerNodeTypes() {
         allow_concurrent: false,
         run_second_pump: false, second_pump_speed_pct: 50,
         use_weigh_station: false, action_threshold_pct: 50, stop_threshold_pct: 50,
+        target_level_pct: 75,
     });
     makeTaskNode('Stop Pumps', 'accessory', 'accessory', { location: 1 });
     makeTaskNode('Read Level', 'accessory', 'accessory', { location: 1, store_as: '' }, [['level', 'number']]);
@@ -4651,7 +4659,7 @@ function renderPropertiesPanel(node) {
             // Pump Reagent: which pump does the job.
             const select = document.createElement('select');
             select.style.cssText = 'width: 100%; padding: 4px 8px; font-size: 11px; font-family: var(--sans); background: var(--bg-input); border: 1px solid var(--border); border-radius: 4px; color: var(--text); outline: none;';
-            for (const [optValue, optLabel] of [['fill', 'Fill'], ['empty', 'Empty']]) {
+            for (const [optValue, optLabel] of [['fill', 'Fill'], ['empty', 'Empty'], ['hold', 'Hold level']]) {
                 const opt = document.createElement('option');
                 opt.value = optValue; opt.textContent = optLabel;
                 if (optValue === value) opt.selected = true;

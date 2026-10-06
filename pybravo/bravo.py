@@ -82,6 +82,10 @@ from pybravo.types import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Hold level stops the pumps if the tray reaches this level (100 % = the range
+# calibration, i.e. full), whatever the regulator is doing.
+HOLD_OVERFLOW_GUARD_PCT = 100.0
 _PICKUP_FAILURE_G_THRESHOLD_MM = 10.0
 _PLATE_SENSOR_UNTRUSTWORTHY_G_THRESHOLD_MM = 7.0
 _DARWIN_HEAD_RESISTOR_OHMS: dict[HeadType, int] = {
@@ -172,6 +176,7 @@ class Bravo:
         self._labware_names: dict[str, int] = {}
         self._simulated_accessory_bus = None
         self._pump_supervisors: set[asyncio.Future] = set()  # concurrent Pump Reagent steps
+        self._hold_controllers: dict[str, Any] = {}  # accessory id -> running LevelHoldController
         self._accessories = AccessoryManager(self._profile, self._accessory_serial_sender)
 
     # -- Context manager --
@@ -321,6 +326,8 @@ class Bravo:
                         "is_open": bool(getattr(driver, "is_open", False)),
                         "is_running": bool(getattr(driver, "is_running", False)),
                         "seconds_remaining": getattr(driver, "seconds_remaining", None),
+                        "hold": self._hold_runtime(device.id),
+                        "pump_speeds": getattr(driver, "pump_speeds", None) or None,
                     },
                 }
             )
@@ -451,8 +458,9 @@ class Bravo:
         use_weigh_station: bool = False,
         action_threshold_pct: float = 50.0,
         stop_threshold_pct: float = 50.0,
+        target_level_pct: float = 75.0,
     ) -> dict[str, Any]:
-        """Fill or empty the autofill reservoir at ``location``.
+        """Fill, empty or hold the autofill reservoir at ``location``.
 
         ``reservoir_mode`` picks the pump that does the job ("fill" or "empty");
         ``run_second_pump`` runs the other one at the same time (fill + drain =
@@ -463,16 +471,27 @@ class Bravo:
         ``stop_threshold_pct``; Empty only acts above the action threshold and
         stops once the level falls to the stop threshold.
 
+        "hold" keeps liquid flowing through the reservoir for ``pump_on_time_s``
+        while holding it at ``target_level_pct``: the fill pump runs at
+        ``pump_speed_pct`` and the weigh pad steers the empty pump (see
+        :class:`LevelHoldController`). It always uses the weigh station.
+
         With ``allow_concurrent`` the step returns as soon as the pumps start so
         the next steps run alongside; otherwise it returns when they stop.
         """
         from pybravo.accessories.autofill import AutofillError
 
         mode = str(reservoir_mode).strip().lower()
-        if mode not in ("fill", "empty"):
-            raise ValueError(f"reservoir_mode must be 'fill' or 'empty', not {reservoir_mode!r}")
+        if mode not in ("fill", "empty", "hold"):
+            raise ValueError(f"reservoir_mode must be 'fill', 'empty' or 'hold', not {reservoir_mode!r}")
         accessory_id = self._autofill_id_at(location)
         driver = self._autofill_driver(accessory_id)
+        if mode == "hold":
+            return await self._hold_reservoir_level(
+                location, accessory_id, driver,
+                inflow_pct=pump_speed_pct, target_pct=target_level_pct,
+                duration_s=pump_on_time_s, allow_concurrent=allow_concurrent,
+            )
         filling = mode == "fill"
 
         def level() -> float:
@@ -531,6 +550,136 @@ class Bravo:
         if use_weigh_station:
             result["end_level_pct"] = level()
         return result
+
+    async def _hold_reservoir_level(
+        self,
+        location: int,
+        accessory_id: str,
+        driver: Any,
+        *,
+        inflow_pct: float,
+        target_pct: float,
+        duration_s: float,
+        allow_concurrent: bool,
+    ) -> dict[str, Any]:
+        from pybravo.accessories.autofill import AutofillError, LevelHoldController
+
+        if not 0.0 <= target_pct < HOLD_OVERFLOW_GUARD_PCT:
+            raise ValueError(f"target_level_pct must be from 0 to below {HOLD_OVERFLOW_GUARD_PCT:g} %")
+        start = driver.read_level()["level_pct"]
+        if start is None:
+            raise ValueError(
+                f"Autofill station at location {location} has no tare/range calibration; "
+                "set tare and range before holding a level"
+            )
+        controller = LevelHoldController(target_pct, inflow_pct)
+        # Decide the first speeds from the level now, before any pump moves.
+        controller.update(float(start), 0.5)
+        try:
+            driver.run_pumps(duration_s, fill=True, empty=True,
+                             fill_speed_pct=controller.inflow, empty_speed_pct=controller.drain)
+        except AutofillError as exc:
+            raise ValueError(str(exc)) from exc
+        # This hold owns only the run it just started: once that run is stopped
+        # or replaced (Stop Pumps, a following Fill/Empty step), it must let go,
+        # or it would switch the fill pump back on against the next step.
+        own_run = driver.run_token
+
+        def still_ours() -> bool:
+            return driver.is_running and driver.run_token == own_run
+
+        result: dict[str, Any] = {"location": location, "accessory_id": accessory_id, "mode": "hold",
+                                  "start_level_pct": float(start), "target_level_pct": target_pct}
+
+        self._hold_controllers[accessory_id] = controller
+
+        async def regulate() -> None:
+            try:
+                await _regulate()
+            finally:
+                if self._hold_controllers.get(accessory_id) is controller:
+                    del self._hold_controllers[accessory_id]
+
+        async def _regulate() -> None:
+            inflow, drain = controller.inflow, controller.drain
+            interval = 0.5
+            while still_ours():
+                await asyncio.sleep(interval)
+                if not still_ours():
+                    break
+                level_now = float(driver.read_level()["level_pct"])
+                if level_now >= HOLD_OVERFLOW_GUARD_PCT:
+                    # Never let a regulation problem overflow the tray.
+                    driver.stop_pumps()
+                    result["overflow_guard"] = True
+                    logger.warning(
+                        "Hold level at location %d: level %.1f %% reached the %.0f %% guard; pumps stopped",
+                        location, level_now, HOLD_OVERFLOW_GUARD_PCT,
+                    )
+                    break
+                new_inflow, new_drain = controller.update(level_now, interval)
+                # Only talk to the module when a speed really changes.
+                if abs(new_inflow - inflow) >= 1.0:
+                    driver.set_pump_speed("fill", new_inflow, run_token=own_run)
+                    inflow = new_inflow
+                if abs(new_drain - drain) >= 1.0:
+                    driver.set_pump_speed("empty", new_drain, run_token=own_run)
+                    drain = new_drain
+                logger.info(
+                    "Hold level at location %d: level %.1f %% (working target %.1f %%) -> "
+                    "inflow %.0f %%, drain %.0f %% (inflow limit %s)",
+                    location, level_now, controller.target, inflow, drain,
+                    "-" if controller.inflow_limit is None else f"{controller.inflow_limit:.0f} %",
+                )
+            result["final_inflow_pct"] = inflow
+            result["final_drain_pct"] = drain
+
+        if allow_concurrent:
+            task = asyncio.ensure_future(regulate())
+            self._pump_supervisors.add(task)
+            task.add_done_callback(self._pump_supervisors.discard)
+            result["status"] = "running"
+            return result
+
+        await regulate()
+        result["status"] = "done"
+        result["end_level_pct"] = driver.read_level()["level_pct"]
+        return result
+
+    def _hold_runtime(self, accessory_id: str) -> dict[str, float] | None:
+        controller = self._hold_controllers.get(accessory_id)
+        if controller is None:
+            return None
+        return {"target_level_pct": controller.requested_target, "step_target_pct": controller.target,
+                "inflow_pct": round(controller.inflow, 1),
+                "requested_inflow_pct": controller.requested_inflow, "drain_pct": round(controller.drain, 1),
+                "inflow_limit_pct": None if controller.inflow_limit is None else round(controller.inflow_limit, 1)}
+
+    def update_autofill_hold(
+        self,
+        accessory_id: str,
+        *,
+        target_level_pct: float | None = None,
+        inflow_pct: float | None = None,
+    ) -> dict[str, Any]:
+        """Change the target and/or inflow of a running Hold level.
+
+        The pumps follow on the next regulation step, ramping at the
+        controller's speed limit rather than jumping.
+        """
+        controller = self._hold_controllers.get(accessory_id)
+        if controller is None:
+            raise ValueError(f"No Hold level is running on {accessory_id!r}")
+        if target_level_pct is not None:
+            if not 0.0 <= target_level_pct < HOLD_OVERFLOW_GUARD_PCT:
+                raise ValueError(f"target_level_pct must be from 0 to below {HOLD_OVERFLOW_GUARD_PCT:g} %")
+            controller.set_target(target_level_pct)
+        if inflow_pct is not None:
+            if not 0.0 <= inflow_pct <= 100.0:
+                raise ValueError("inflow_pct must be from 0 to 100 %")
+            controller.set_inflow(inflow_pct)
+        return {"accessory_id": accessory_id, "target_level_pct": controller.requested_target,
+                "inflow_pct": controller.requested_inflow}
 
     async def autofill_stop_pumps(self, location: int) -> dict[str, Any]:
         return self.stop_autofill_pumps(self._autofill_id_at(location))

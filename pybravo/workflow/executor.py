@@ -408,6 +408,7 @@ def _build_task_params(node_type: str, properties: dict[str, Any]) -> dict[str, 
             params["use_weigh_station"] = bool(properties.get("use_weigh_station", False))
             params["action_threshold_pct"] = float(properties.get("action_threshold_pct", 50))
             params["stop_threshold_pct"] = float(properties.get("stop_threshold_pct", 50))
+            params["target_level_pct"] = float(properties.get("target_level_pct", 75))
 
     elif node_type == "system/Home":
         axes_str = properties.get("axes", "X,Y,Z,W,G,Zg")

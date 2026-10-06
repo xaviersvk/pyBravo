@@ -1793,6 +1793,44 @@ async def run_autofill_pumps(accessory_id: str, req: AutofillRunRequest):
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+class AutofillHoldRequest(BaseModel):
+    target_level_pct: float
+    inflow_pct: float = 50.0
+    duration_s: float
+
+
+@app.post("/api/accessories/{accessory_id}/autofill/hold", **_route_meta("State", "Hold the autofill level", "Runs fill and drain together for duration_s while the weigh pad steers the drain to hold target_level_pct at the given inflow. Returns at once; the pumps stop after duration_s, on Stop, or if the tray reaches 100 %."))
+async def hold_autofill_level(accessory_id: str, req: AutofillHoldRequest):
+    try:
+        bravo = get_bravo()
+        device = bravo._accessories.find_by_id(accessory_id)
+        if device is None or device.type != "autofill":
+            raise ValueError(f"Accessory {accessory_id!r} is not an autofill station")
+        return await bravo.pump_reagent(
+            int(device.location or 0), reservoir_mode="hold", pump_speed_pct=req.inflow_pct,
+            target_level_pct=req.target_level_pct, pump_on_time_s=req.duration_s, allow_concurrent=True,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.warning("Autofill hold failed for %s: %s", accessory_id, exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+class AutofillHoldUpdateRequest(BaseModel):
+    target_level_pct: float | None = None
+    inflow_pct: float | None = None
+
+
+@app.post("/api/accessories/{accessory_id}/autofill/hold/update", **_route_meta("State", "Change a running Hold level", "Changes the target level and/or inflow of a running Hold level; pump speeds ramp to the new values."))
+async def update_autofill_hold(accessory_id: str, req: AutofillHoldUpdateRequest):
+    try:
+        return get_bravo().update_autofill_hold(
+            accessory_id, target_level_pct=req.target_level_pct, inflow_pct=req.inflow_pct,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
 @app.post("/api/accessories/{accessory_id}/autofill/stop", **_route_meta("State", "Stop autofill pumps", "Stops every pump on the autofill station's pump module."))
 async def stop_autofill_pumps(accessory_id: str):
     try:
