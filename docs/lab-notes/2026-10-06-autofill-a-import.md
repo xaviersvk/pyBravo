@@ -76,6 +76,14 @@ Nabudúce:
 - Zmerať taru s plnými hadicami.
 - Skúsiť umývanie s reálnymi špičkami: hold 80 % a súbežný Mix (workflow
   `b4620de8…`). Čas holdu musí pokryť všetky miešania.
+  Simulácia z 6. 10. večer prebehla celá bez chýb: oprava Stop → Empty
+  funguje, vanička sa vypustí a prítok zostane vypnutý.
+  **Chyba v poradí krokov:** Hold beží súbežne a vráti sa hneď, takže prvý
+  Mix začne v prázdnej vaničke. Pred Hold treba pridať „Fill by weight do
+  ~80 %“.
+- PR #5 (do pôvodného repozitára) dopĺňa Hold level a sekciu „Hardware
+  findings“. Na HW sa Hold skúšal len cez ručný panel, nie ako workflow.
+  Posledná verzia zavodňovania je overená len v simulácii.
 - Čiastočne plná krabička špičiek: použiť existujúci head mode.
 
 ## 1. Import z exportu registrov
