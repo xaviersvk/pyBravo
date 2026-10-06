@@ -10,10 +10,12 @@ lokálne na laboratórnom PC (pozri koniec).
 |---|---|---|
 | [kelsorj/pyBravo#2](https://github.com/kelsorj/pyBravo/pull/2) | Oprava importu labware z exportu registrov a Labware Editora, ktorý nuloval geometriu jamiek | otvorený |
 | [kelsorj/pyBravo#3](https://github.com/kelsorj/pyBravo/pull/3) | Autofill station: pumpy, váha, UI panel a 3D model. **Zatiaľ len ručné ovládanie, nie je pripravené na pipeline.** | otvorený |
+| [kelsorj/pyBravo#4](https://github.com/kelsorj/pyBravo/pull/4) | Farebné označenie pôvodu: Imported / Imported, edited / Local | otvorený |
 
 Vetvy v našom forku:
 - `fix/labware-registry-import` (PR #2)
 - `feature/autofill-station` (PR #3)
+- `feature/provenance-colours` (PR #4)
 - `lab-notes` (tento súbor)
 
 ## 1. Import z exportu registrov
@@ -77,7 +79,7 @@ Formát sme zistili zo sieťovej komunikácie nášho prístroja:
 **Nie je hotové:** krok workflowu (pipeline) na plnenie alebo vyprázdnenie,
 čakanie na hladinu a blokovanie pipetovania počas plnenia.
 
-## 3. Farebné označenie pôvodu (len lokálne, zatiaľ bez PR)
+## 3. Farebné označenie pôvodu (PR #4)
 
 V profiloch, labware, liquid classes a príslušenstve sa farebne odlišuje, čo
 pochádza z importu a čo vzniklo v pyBravo:
@@ -88,9 +90,11 @@ pochádza z importu a čo vzniklo v pyBravo:
 | 🟠 Imported, edited | z importu, potom upravené v pyBravo |
 | 🟢 Local | vytvorené v pyBravo |
 
-Import profilu teraz berie z registrov aj príslušenstvo (autofill a Teleshake).
-Tieto zmeny sú zatiaľ **necommitnuté** v pracovnom adresári na laboratórnom PC.
-Keď ich budeme chcieť poslať, spravíme z nich ďalší PR.
+V editore labware je aj filter podľa pôvodu.
+
+**Ešte bez PR:** import príslušenstva (autofill a Teleshake) z profilu v
+registroch. Potrebuje typ `autofill` z PR #3, preto ho pošleme až po jeho
+zlúčení. Zatiaľ je necommitnutý v pracovnom adresári na laboratórnom PC.
 
 ## Na laboratórnom PC (mimo repozitára)
 
