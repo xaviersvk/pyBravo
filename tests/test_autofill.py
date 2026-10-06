@@ -95,6 +95,17 @@ def test_run_starts_both_pumps_and_watchdog_stops_them():
     assert bus.stops == 2
 
 
+def test_running_pumps_are_kept_alive_with_status_polls():
+    """The module stops pumps on its own unless the host keeps polling it."""
+    bus = RecordingBus()
+    station = _station(bus)
+    station.run_pumps(1.0)
+    time.sleep(1.4)
+    polls = [p for p in bus.sent if p == bytes.fromhex("af 01 00 00 00 00 00 00 00")]
+    assert len(polls) >= 2
+    assert not station.is_running
+
+
 def test_manual_stop_cancels_the_watchdog():
     bus = RecordingBus()
     station = _station(bus)
