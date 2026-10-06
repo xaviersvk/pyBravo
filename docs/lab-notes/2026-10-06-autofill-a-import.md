@@ -39,6 +39,45 @@ flowing (5x)“: tipy 70 µL z pozície 9, umývanie v 3, späť do 9) sú loká
 workflowy v `~/.pybravo/workflows` na laboratórnom PC, nie v repozitári.
 Hodnoty miešania sú v nich zatiaľ zástupné.
 
+## Hold level: udržiavanie hladiny pri prietoku (večer 6. 10.)
+
+Režim **Hold level** v Pump Reagent (a v ručnom paneli) plní aj vypúšťa naraz
+a podľa váhy drží cieľovú hladinu. Cieľ aj prítok sa dajú meniť za behu. Panel
+ukazuje rýchlosti púmp a 120 s graf. Lokálny workflow „Tip wash in flow,
+hold 80 %“ mieša špičky v pretekajúcej vode.
+
+Merania na stanici 384ST (dlhé behy, krátke 5 s behy sú na bublinu
+nepoužiteľné):
+- **Pumpy sú rovnako silné.** „Slabší odtok“ (3 %/s) bola bublina v odtokovej
+  hadici. Po 30 s preplachu na 100 % má odtok ~10 %/s pri 100 % a 3,1 %/s pri
+  30 % (lineárne). Prítok má ~4,7 %/s pri 50 % a ~7,5–8 %/s pri 100 %.
+  Mŕtvy čas: prítok ~0,6 s, odtok ~1 s (pri plných hadiciach).
+- **Suché hadice.** Odtok, ktorý bežal naprázdno, na 30–40 % vôbec nepotiahne
+  (0,13 %/s za 30 s), na 100 % sa zavodní za 1–5 s. Prívod sa v pokoji vracia
+  do zdroja. Na 50 % potom nedodal nič za 90 s, na 100 % voda prišla po 6–10 s.
+- **Váha.** Šum ±0,7 %. Prázdna vanička ukazuje −10 až −12 % podľa toho, či sú
+  hadice plné, takže taru treba merať v rovnakom stave hadíc ako pri práci.
+- **Regulátor.** Nové predvolené hodnoty sú naladené na modeli podľa týchto
+  meraní: kp 1,5, ki 0,2, lookahead 1 s, zmena odtoku 20 %/s, rampa cieľa
+  15 %/s. Na HW pri 75 → 50 % klesol jitter odtoku z ~11 na 2,5–4,5 %/vzorku.
+  Odchýlka bola ±2 % pri 75 % a ~3,5 % pri 50 % (ešte bez rýchlejšieho
+  odvíjania integrálu).
+- **Zavodnenie v Hold.** Prítok ide na 100 %, kým hladina nestúpne, potom
+  hneď na požadovanú hodnotu. Odtok ide 15 % pod cieľom na 100 %, kým hladina
+  zreteľne neklesá (max 8 s). **Overené len v simulácii a testoch.** Posledný
+  HW beh mal ešte pevný 1,5 s pulz a ten na úplne suchú linku nestačil (plató
+  na 85 % na 13 s).
+- Opravená chyba: Hold po Stop Pumps ďalej reguloval a v nasledujúcom kroku
+  Empty znova zapínal prítok.
+
+Nabudúce:
+- Overiť zavodnenie odtoku na HW (`hw_exp.py hold 90 75 50 50 50` so suchým
+  odtokom).
+- Zmerať taru s plnými hadicami.
+- Skúsiť umývanie s reálnymi špičkami: hold 80 % a súbežný Mix (workflow
+  `b4620de8…`). Čas holdu musí pokryť všetky miešania.
+- Čiastočne plná krabička špičiek: použiť existujúci head mode.
+
 ## 1. Import z exportu registrov
 
 pyBravo vie načítať profil prístroja z exportu registrov Windows (`.reg`), cez
