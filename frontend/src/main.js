@@ -4773,6 +4773,53 @@ function renderAccessoryList() {
     scheduleDeckVisualRefresh();
 }
 
+// Accessory 3D model: "Built-in" leaves model.path empty so each type uses its
+// own visual (the Teleshake model, the procedural autofill tray); otherwise a
+// model from frontend/accessories or a custom path.
+let accessoryModelOptions = [];
+
+async function loadAccessoryModelOptions() {
+    const res = await apiCall('/api/accessories/models', 'GET');
+    accessoryModelOptions = Array.isArray(res?.models) ? res.models : [];
+    populateAccessoryModelChoice(String(selectedAccessory()?.model?.path || '').trim());
+}
+
+function populateAccessoryModelChoice(path) {
+    const select = document.getElementById('prof-accessory-model-choice');
+    if (!select) return;
+    select.replaceChildren(
+        new Option('Built-in (default for type)', '__default__'),
+        ...accessoryModelOptions.map(model => new Option(model.name, model.path)),
+        new Option('Custom path…', '__custom__'),
+    );
+    const known = accessoryModelOptions.some(model => model.path === path);
+    select.value = !path ? '__default__' : (known ? path : '__custom__');
+    setInput('prof-accessory-model-path', select.value === '__custom__' ? path : '');
+    updateAccessoryModelPathRow();
+}
+
+function updateAccessoryModelPathRow() {
+    const custom = document.getElementById('prof-accessory-model-choice')?.value === '__custom__';
+    const row = document.getElementById('prof-accessory-model-path-row');
+    if (row) row.style.display = custom ? '' : 'none';
+}
+
+function readAccessoryModelChoice() {
+    const choice = document.getElementById('prof-accessory-model-choice')?.value || '__default__';
+    if (choice === '__default__') return '';
+    if (choice === '__custom__') return (document.getElementById('prof-accessory-model-path')?.value || '').trim();
+    return choice;
+}
+
+document.getElementById('prof-accessory-model-choice')?.addEventListener('change', () => {
+    updateAccessoryModelPathRow();
+    // Not re-rendering here: picking "Custom path…" must keep the empty path
+    // field open until a path is typed.
+    saveAccessoryEditorToState();
+    scheduleDeckVisualRefresh();
+});
+void loadAccessoryModelOptions();
+
 function updateAccessoryTypePanels(type) {
     document.querySelectorAll('.accessory-type-panel').forEach(panel => panel.classList.remove('active'));
     const panelIds = { teleshake: 'accessory-panel-teleshake', autofill: 'accessory-panel-autofill' };
@@ -4797,7 +4844,7 @@ function populateAccessoryEditor(device) {
     if (locSel) locSel.value = String(device.location || 0);
     setInput('prof-accessory-port', device.connection?.port || (device.type === 'barcode_reader' ? 'COM5' : 'COM4'));
     setCheck('prof-accessory-holds-labware', device.holds_labware !== false);
-    setInput('prof-accessory-model-path', accessoryModelPath(device));
+    populateAccessoryModelChoice(String(device.model?.path || '').trim());
     setInput('prof-accessory-z-hint', device.teachpoint_hint?.z_delta_mm ?? 0);
 
     const scannerType = document.getElementById('prof-accessory-barcode-device-type');
@@ -4853,7 +4900,7 @@ function readAccessoryEditor() {
         settings.empty_direction = document.getElementById('prof-accessory-autofill-empty-direction')?.value || 'reverse';
         settings.empty_speed_pct = num('prof-accessory-autofill-empty-speed', 50);
     }
-    const modelPath = (document.getElementById('prof-accessory-model-path')?.value || '').trim();
+    const modelPath = readAccessoryModelChoice();
     const zHint = parseFloat(document.getElementById('prof-accessory-z-hint')?.value || '0');
     return normalizeAccessoryDevice({
         ...current,

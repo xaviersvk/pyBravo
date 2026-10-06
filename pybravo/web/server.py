@@ -1751,6 +1751,19 @@ async def stop_teleshake(accessory_id: str):
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+_ACCESSORY_MODEL_DIR = Path(__file__).resolve().parents[2] / "frontend" / "accessories"
+
+
+@app.get("/api/accessories/models", **_route_meta("State", "List accessory 3D models", "Lists the glTF models in frontend/accessories that an accessory can use for its deck visual."))
+async def list_accessory_models():
+    models = []
+    if _ACCESSORY_MODEL_DIR.is_dir():
+        for path in sorted(_ACCESSORY_MODEL_DIR.iterdir()):
+            if path.is_file() and path.suffix.lower() in (".gltf", ".glb"):
+                models.append({"name": path.stem, "path": f"/static/accessories/{path.name}"})
+    return {"models": models}
+
+
 @app.get("/api/accessories/{accessory_id}/autofill/level", **_route_meta("State", "Read an autofill weigh pad", "Reads the raw weigh-pad A/D value and the fill level computed from the profile's tare and range."))
 async def read_autofill_level(accessory_id: str):
     try:
