@@ -543,8 +543,22 @@ class DarwinController(BravoController):
         if axes is None:
             axes = list(all_axes())
 
-        # First make sure the safety condition has cleared
-        if self._is_estop_engaged():
+        # First make sure the safety condition has cleared. Fail closed: a
+        # status that cannot be read is not a clear interlock
+        # (_is_estop_engaged reports False when the read fails).
+        try:
+            safety_status = self._engine.master_get_uint(
+                DarwinMasterNodeSubCommands.SAFETY_STATUS, timeout_ms=2000
+            )
+        except Exception as exc:
+            raise BravoError(
+                ErrorType.COULD_NOT_QUERY_STATE,
+                custom_text=(
+                    f"Cannot recover: could not read the safety status ({exc}). "
+                    "Nothing was re-enabled."
+                ),
+            ) from exc
+        if safety_status & 0x01:
             raise BravoError(
                 ErrorType.ROBOT_DISABLE,
                 custom_text=(
@@ -1300,6 +1314,24 @@ class DarwinController(BravoController):
                 f"0x{int(command_id):02X}."
             ),
         )
+
+    # ------------------------------------------------------------------
+    # Serial peripherals forwarded by the instrument
+    # ------------------------------------------------------------------
+
+    def send_serial(self, payload: bytes, timeout_ms: int = 1000) -> bytes:
+        """Send a 9-byte payload to a serial peripheral behind the instrument.
+
+        Accessory modules on the instrument's accessory bus (the autofill pump
+        module and weigh pad) are reached this way rather than over a COM port.
+        Returns the peripheral's response; the first byte echoes the command.
+        """
+        if not self.is_connected:
+            raise BravoError(
+                ErrorType.DARWIN_SOFTWARE_INTERNAL,
+                custom_text="Cannot reach accessory module: not connected.",
+            )
+        return self._engine.send_serial(payload, timeout_ms=timeout_ms)
 
     # ------------------------------------------------------------------
     # Error tracking

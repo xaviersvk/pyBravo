@@ -184,6 +184,41 @@ _NODE_CATALOG: tuple[tuple[str, dict[str, Any]], ...] = (
         "required": ("location",),
         "optional": ("expected_count", "store_as"),
     }),
+    ("accessory/PumpReagent", {
+        "desc": (
+            "Fill or empty the autofill reservoir at `location` "
+            "(`reservoir_mode` \"fill\" or \"empty\") at `pump_speed_pct` for up "
+            "to `pump_on_time_s` seconds (1-600). Typical tip wash: Pump "
+            "Reagent fill, Mix at that location as if it were a plate, Pump "
+            "Reagent empty, inside a Loop. `run_second_pump` runs the other "
+            "pump too (fill + drain = flowing). `allow_concurrent`=true lets "
+            "the next steps run while it pumps. `how_often`=N acts on the "
+            "first pass and every Nth one. With `use_weigh_station`, fill acts "
+            "only below `action_threshold_pct` and stops at "
+            "`stop_threshold_pct` (empty: above / down to). "
+            "`reservoir_mode` \"hold\" keeps liquid flowing for "
+            "`pump_on_time_s` at `target_level_pct`: inflow at "
+            "`pump_speed_pct`, the weigh pad steers the drain."
+        ),
+        "required": ("location",),
+        "optional": ("reservoir_mode", "pump_speed_pct", "pump_on_time_s", "how_often",
+                     "allow_concurrent", "run_second_pump", "second_pump_speed_pct",
+                     "use_weigh_station", "action_threshold_pct", "stop_threshold_pct",
+                     "target_level_pct"),
+    }),
+    ("accessory/StopPumps", {
+        "desc": "Stop all pumps of the autofill station at `location`.",
+        "required": ("location",),
+        "optional": (),
+    }),
+    ("accessory/ReadLevel", {
+        "desc": (
+            "Read the weigh-pad level (percent; 0 = tare, 100 = range) of the "
+            "autofill station at `location`. `store_as` writes it to vars[...]."
+        ),
+        "required": ("location",),
+        "optional": ("store_as",),
+    }),
     ("logic/Script", {
         "desc": (
             "Runs user-authored Python at this point in the flow. Sees "
