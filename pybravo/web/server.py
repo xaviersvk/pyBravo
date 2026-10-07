@@ -1168,6 +1168,16 @@ async def ignore_error():
     accepted = get_bravo().ignore()
     return {"status": "ignored", "accepted": bool(accepted)}
 
+@app.post("/api/recover", **_route_meta("Connection", "Recover after a safety stop", "After a light-curtain trip or E-stop: checks that the safety interlock is clear, then re-enables the axes the controller disabled. Moves nothing. Refused while a task step is still executing. Afterwards retract Z and Home All (or Retry the step the safety stop interrupted)."))
+async def recover_after_safety_stop():
+    from pybravo.bravo import RecoverRefused
+
+    bravo = get_bravo()
+    try:
+        return await asyncio.to_thread(bravo.recover)
+    except RecoverRefused as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
 
 # -- REST endpoints: Motion --
 

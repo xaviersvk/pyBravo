@@ -86,6 +86,16 @@ logger = logging.getLogger(__name__)
 # Hold level stops the pumps if the tray reaches this level (100 % = the range
 # calibration, i.e. full), whatever the regulator is doing.
 HOLD_OVERFLOW_GUARD_PCT = 100.0
+
+
+class RecoverRefused(RuntimeError):
+    """Safety-stop recovery was refused, or the controller reported that it failed."""
+
+    def __init__(self, message: str, *, status_code: int = 409) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
 _PICKUP_FAILURE_G_THRESHOLD_MM = 10.0
 _PLATE_SENSOR_UNTRUSTWORTHY_G_THRESHOLD_MM = 7.0
 _DARWIN_HEAD_RESISTOR_OHMS: dict[HeadType, int] = {
@@ -875,7 +885,11 @@ class Bravo:
             async def _auto_resolve() -> None:
                 while True:
                     await asyncio.sleep(0.05)
-                    if self._engine._awaiting_error_action:
+                    if self._engine.awaiting_safety_stop:
+                        # Never auto-retry into a latched safety interlock.
+                        logger.error("Safety stop during initialize; aborting (auto_confirm=True)")
+                        self._engine.resolve_error(ErrorAction.ABORT)
+                    elif self._engine._awaiting_error_action:
                         logger.info("Auto-confirming operator prompt (auto_confirm=True)")
                         self._engine.resolve_error(ErrorAction.RETRY)
             auto_resolve_task = asyncio.create_task(_auto_resolve())
@@ -3159,6 +3173,39 @@ class Bravo:
 
     def ignore(self) -> bool:
         return self._engine.ignore()
+
+    def recover(self) -> dict[str, Any]:
+        """Recover the controller after a safety stop (light curtain / E-stop).
+
+        Checks that the interlock is clear and re-enables the axes the
+        controller disabled. Moves nothing: afterwards the operator retracts Z
+        and homes (or, while a task waits on its safety-stop prompt, may Retry).
+
+        Refused while a task step is still executing: re-enabling axes under a
+        step that is still waiting on a move (e.g. a move timeout) could let
+        that motion resume.
+        """
+        ctrl = self._controller
+        recover = getattr(ctrl, "recover", None)
+        if ctrl is None or not callable(recover):
+            raise RecoverRefused("This controller has no safety-stop recovery", status_code=400)
+        if self._engine.is_busy and not self._engine.awaiting_error_action:
+            raise RecoverRefused(
+                "A task step is still running; wait until it fails and shows its prompt, then Recover",
+                status_code=409,
+            )
+        try:
+            axes = recover()
+        except Exception as exc:
+            raise RecoverRefused(str(exc), status_code=409) from exc
+        states = {getattr(axis, "name", str(axis)): str(state) for axis, state in (axes or {}).items()}
+        complete = all(state in ("enabled", "ok") for state in states.values())
+        if complete:
+            self._engine.note_recovered()
+            logger.warning("Recovered after a safety stop: %s", states)
+        else:
+            logger.error("Recovery after a safety stop is INCOMPLETE: %s", states)
+        return {"status": "recovered" if complete else "incomplete", "axes": states}
 
     @staticmethod
     def _build_teachpoints(profile: BravoProfile) -> Teachpoints:
