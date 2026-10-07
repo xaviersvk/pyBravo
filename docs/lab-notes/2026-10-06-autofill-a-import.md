@@ -97,6 +97,30 @@ Nabudúce:
   zlyhala bezpečne. Pridané preto opätovné zavodnenie: keď sa hladina 4 s
   nehýbe (prítok beží, odtok zatvorený), prítok ide znova na 100 %. Pri suchom
   prívode to trvalo ~57 s.
+- **7. 10. večer: zlyhanie s tipmi a preliatie vaničky.**
+  - Počas Tips On niekto prešiel svetelnou bránou (STOP_DISABLE) a Z sa
+    nevrátil hore.
+  - Workflow napriek tomu pokračoval (Tips On označený ako OK) a pustil vodu.
+  - Pumpový modul potom na všetko odpovedal chybou 0x0B a pumpy nešli
+    zastaviť. Zastavili sa až po vypnutí servera, keď prestalo pollovanie
+    (keepalive).
+  - VWorks modul pri svojej inicializácii „odblokoval“; pyBravo to zatiaľ
+    nevie.
+  - Kód som potom vrátil do stavu z rána 7. 10. Všetko z toho dňa je v
+    `Documents\pyBravo-backup-2026-10-07-before-revert` a v commite
+    `b50fd29`.
+- **Nový postup.** Veľké veci vyvíjame najprv v našom forku a autorom ich
+  pošleme ako celok, keď budú otestované na prístroji.
+  - Upstream PR #3 a #5 sú v drafte.
+  - Vývoj beží vo vetve `autofill` (fork PR xaviersvk/pyBravo#1, so zoznamom
+    toho, čo treba opraviť).
+  - Agent opravuje: zlyhaný krok musí zastaviť workflow aj pumpy; obnovenie
+    po svetelnej bráne (Recover); fail-closed pri chybe modulu (prestať
+    pollovať, ukončiť hold).
+  - Na prístroji treba ešte nahrať štart VWorks (capture) a zistiť, ako
+    zrušiť 0x0B. Potom otestovať protokol s tipmi.
+  - Na tipwash: Mix 25 µL (30 µL tipy), 20 mm nad dnom. Tip box na 9 je
+    plný len do polovice, použiť head mode.
 - PR #5 (do pôvodného repozitára) dopĺňa Hold level a sekciu „Hardware
   findings“. Na HW sa Hold skúšal len cez ručný panel, nie ako workflow.
   Posledná verzia zavodňovania je overená len v simulácii.
