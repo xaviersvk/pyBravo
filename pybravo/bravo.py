@@ -6,6 +6,7 @@ state machine, deck model, and profile into a single async API.
 
 import asyncio
 import logging
+import time
 from pathlib import Path
 from typing import Any
 
@@ -86,6 +87,9 @@ logger = logging.getLogger(__name__)
 # Hold level stops the pumps if the tray reaches this level (100 % = the range
 # calibration, i.e. full), whatever the regulator is doing.
 HOLD_OVERFLOW_GUARD_PCT = 100.0
+# A hold that counts its time from the target starts the clock once the level
+# is this close to it (weigh-pad ripple is about +-0.7 %).
+HOLD_REACHED_TOLERANCE_PCT = 2.0
 _PICKUP_FAILURE_G_THRESHOLD_MM = 10.0
 _PLATE_SENSOR_UNTRUSTWORTHY_G_THRESHOLD_MM = 7.0
 _DARWIN_HEAD_RESISTOR_OHMS: dict[HeadType, int] = {
@@ -177,6 +181,7 @@ class Bravo:
         self._simulated_accessory_bus = None
         self._pump_supervisors: set[asyncio.Future] = set()  # concurrent Pump Reagent steps
         self._hold_controllers: dict[str, Any] = {}  # accessory id -> running LevelHoldController
+        self._hold_clocks: dict[str, dict[str, Any]] = {}  # accessory id -> hold phase / end time
         self._accessories = AccessoryManager(self._profile, self._accessory_serial_sender)
 
     # -- Context manager --
@@ -459,6 +464,9 @@ class Bravo:
         action_threshold_pct: float = 50.0,
         stop_threshold_pct: float = 50.0,
         target_level_pct: float = 75.0,
+        time_from_target: bool = False,
+        max_reach_time_s: float = 120.0,
+        wait_for_target: bool = True,
     ) -> dict[str, Any]:
         """Fill, empty or hold the autofill reservoir at ``location``.
 
@@ -474,7 +482,13 @@ class Bravo:
         "hold" keeps liquid flowing through the reservoir for ``pump_on_time_s``
         while holding it at ``target_level_pct``: the fill pump runs at
         ``pump_speed_pct`` and the weigh pad steers the empty pump (see
-        :class:`LevelHoldController`). It always uses the weigh station.
+        :class:`LevelHoldController`). It always uses the weigh station. With
+        ``time_from_target`` the ``pump_on_time_s`` clock starts only once the
+        hoses are primed and the level is at the target; getting there may
+        take up to ``max_reach_time_s``, after which the pumps stop and the
+        step fails. Combined with ``allow_concurrent`` the step returns when
+        the target is reached and the hold continues alongside the next steps
+        (``wait_for_target=False`` returns at once, as the manual panel needs).
 
         With ``allow_concurrent`` the step returns as soon as the pumps start so
         the next steps run alongside; otherwise it returns when they stop.
@@ -491,6 +505,8 @@ class Bravo:
                 location, accessory_id, driver,
                 inflow_pct=pump_speed_pct, target_pct=target_level_pct,
                 duration_s=pump_on_time_s, allow_concurrent=allow_concurrent,
+                time_from_target=time_from_target, max_reach_time_s=max_reach_time_s,
+                wait_for_target=wait_for_target,
             )
         filling = mode == "fill"
 
@@ -561,11 +577,16 @@ class Bravo:
         target_pct: float,
         duration_s: float,
         allow_concurrent: bool,
+        time_from_target: bool = False,
+        max_reach_time_s: float = 120.0,
+        wait_for_target: bool = True,
     ) -> dict[str, Any]:
         from pybravo.accessories.autofill import AutofillError, LevelHoldController
 
         if not 0.0 <= target_pct < HOLD_OVERFLOW_GUARD_PCT:
             raise ValueError(f"target_level_pct must be from 0 to below {HOLD_OVERFLOW_GUARD_PCT:g} %")
+        if time_from_target and max_reach_time_s <= 0:
+            raise ValueError("max_reach_time_s must be positive")
         start = driver.read_level()["level_pct"]
         if start is None:
             raise ValueError(
@@ -575,8 +596,17 @@ class Bravo:
         controller = LevelHoldController(target_pct, inflow_pct)
         # Decide the first speeds from the level now, before any pump moves.
         controller.update(float(start), 0.5)
+        # With time_from_target the run must also cover getting there; the
+        # hold itself is then ended by the regulation loop below.
+        run_s = duration_s + (max_reach_time_s if time_from_target else 0.0)
+        max_run = getattr(getattr(driver, "_config", None), "max_run_s", None)
+        if time_from_target and max_run is not None and run_s > max_run:
+            raise ValueError(
+                f"Hold time {duration_s:g} s plus up to {max_reach_time_s:g} s to reach the target "
+                f"exceeds the station's {max_run:g} s run limit; shorten one of them"
+            )
         try:
-            driver.run_pumps(duration_s, fill=True, empty=True,
+            driver.run_pumps(run_s, fill=True, empty=True,
                              fill_speed_pct=controller.inflow, empty_speed_pct=controller.drain)
         except AutofillError as exc:
             raise ValueError(str(exc)) from exc
@@ -592,6 +622,11 @@ class Bravo:
                                   "start_level_pct": float(start), "target_level_pct": target_pct}
 
         self._hold_controllers[accessory_id] = controller
+        # Hold clock for time_from_target: "reaching" until primed and at the
+        # target, then "holding" for duration_s.
+        clock: dict[str, Any] = {"phase": "reaching" if time_from_target else "holding",
+                                 "started": time.monotonic(), "hold_until": None}
+        self._hold_clocks[accessory_id] = clock
 
         async def regulate() -> None:
             try:
@@ -599,6 +634,28 @@ class Bravo:
             finally:
                 if self._hold_controllers.get(accessory_id) is controller:
                     del self._hold_controllers[accessory_id]
+                if self._hold_clocks.get(accessory_id) is clock:
+                    del self._hold_clocks[accessory_id]
+
+        def tick_clock(level_now: float) -> None:
+            now = time.monotonic()
+            if clock["phase"] == "reaching":
+                at_target = abs(level_now - controller.requested_target) <= HOLD_REACHED_TOLERANCE_PCT
+                if controller.ready and at_target:
+                    clock["phase"] = "holding"
+                    clock["hold_until"] = now + duration_s
+                    result["reached_target_after_s"] = round(now - clock["started"], 1)
+                    logger.info("Hold level at location %d: target %.1f %% reached after %.1f s; holding %.0f s",
+                                location, controller.requested_target, now - clock["started"], duration_s)
+                elif now - clock["started"] >= max_reach_time_s:
+                    driver.stop_pumps()
+                    result["target_not_reached"] = True
+                    logger.warning("Hold level at location %d: target %.1f %% not reached within %.0f s "
+                                   "(level %.1f %%); pumps stopped",
+                                   location, controller.requested_target, max_reach_time_s, level_now)
+            elif clock["hold_until"] is not None and now >= clock["hold_until"]:
+                driver.stop_pumps()
+                result["held_s"] = duration_s
 
         async def _regulate() -> None:
             inflow, drain = controller.inflow, controller.drain
@@ -608,6 +665,10 @@ class Bravo:
                 if not still_ours():
                     break
                 level_now = float(driver.read_level()["level_pct"])
+                if time_from_target:
+                    tick_clock(level_now)
+                    if not still_ours():
+                        break
                 if level_now >= HOLD_OVERFLOW_GUARD_PCT:
                     # Never let a regulation problem overflow the tray.
                     driver.stop_pumps()
@@ -638,19 +699,43 @@ class Bravo:
             task = asyncio.ensure_future(regulate())
             self._pump_supervisors.add(task)
             task.add_done_callback(self._pump_supervisors.discard)
+            if time_from_target and wait_for_target:
+                # Return once the level is at the target, so the next steps
+                # (e.g. a Mix) never start in an empty or priming reservoir;
+                # the hold then keeps running alongside them.
+                while clock["phase"] == "reaching" and not task.done():
+                    await asyncio.sleep(0.25)
+                if result.get("target_not_reached") or clock["phase"] == "reaching":
+                    if not task.done():
+                        driver.stop_pumps()
+                    raise ValueError(
+                        f"Hold level at location {location}: target {target_pct:g} % not reached within "
+                        f"{max_reach_time_s:g} s; pumps stopped"
+                    )
             result["status"] = "running"
             return result
 
         await regulate()
         result["status"] = "done"
         result["end_level_pct"] = driver.read_level()["level_pct"]
+        if result.get("target_not_reached"):
+            raise ValueError(
+                f"Hold level at location {location}: target {target_pct:g} % not reached within "
+                f"{max_reach_time_s:g} s (level {result['end_level_pct']:.1f} %); pumps stopped"
+            )
         return result
 
     def _hold_runtime(self, accessory_id: str) -> dict[str, float] | None:
         controller = self._hold_controllers.get(accessory_id)
         if controller is None:
             return None
-        return {"target_level_pct": controller.requested_target, "step_target_pct": controller.target,
+        clock = self._hold_clocks.get(accessory_id) or {}
+        hold_left = None
+        if clock.get("hold_until") is not None:
+            hold_left = round(max(0.0, clock["hold_until"] - time.monotonic()), 1)
+        return {"phase": clock.get("phase"), "hold_seconds_remaining": hold_left,
+                "fill_reprimes": getattr(controller, "fill_reprimes", 0),
+                "target_level_pct": controller.requested_target, "step_target_pct": controller.target,
                 "inflow_pct": round(controller.inflow, 1),
                 "requested_inflow_pct": controller.requested_inflow, "drain_pct": round(controller.drain, 1),
                 "inflow_limit_pct": None if controller.inflow_limit is None else round(controller.inflow_limit, 1)}
