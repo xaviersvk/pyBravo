@@ -945,6 +945,7 @@ body {
         </div>
         <div class="modal-footer" style="gap: 8px;">
             <button class="toolbar-btn" id="task-prompt-abort" style="font-size: 11px;">Abort</button>
+            <button class="toolbar-btn" id="task-prompt-recover" style="font-size: 11px; display: none;" title="Re-enable the axes after the safety stop is cleared. Moves nothing.">Recover</button>
             <button class="toolbar-btn" id="task-prompt-ignore" style="font-size: 11px;">Ignore</button>
             <button class="toolbar-btn primary" id="task-prompt-retry" style="font-size: 11px;">Retry</button>
         </div>
@@ -7596,10 +7597,40 @@ function updateTaskPromptModalFromState(taskStatus) {
     retryBtn.style.display = choices.includes('retry') ? '' : 'none';
     ignoreBtn.style.display = choices.includes('ignore') ? '' : 'none';
     abortBtn.style.display = choices.includes('abort') ? '' : 'none';
+    const recoverBtn = document.getElementById('task-prompt-recover');
+    if (recoverBtn) {
+        recoverBtn.style.display = choices.includes('recover') ? '' : 'none';
+        recoverBtn.disabled = taskPromptState.actionPending;
+    }
     retryBtn.disabled = taskPromptState.actionPending;
     ignoreBtn.disabled = taskPromptState.actionPending;
     abortBtn.disabled = taskPromptState.actionPending;
     overlay.classList.remove('hidden');
+}
+
+// Safety stop: re-enable the axes once the light curtain / E-stop is cleared.
+// Moves nothing. The prompt stays open so the operator can then Retry or Abort.
+async function recoverFromTaskPrompt() {
+    const detailsEl = document.getElementById('task-prompt-details');
+    const recoverBtn = document.getElementById('task-prompt-recover');
+    if (recoverBtn) recoverBtn.disabled = true;
+    try {
+        const res = await fetch(`${API_BASE}/api/recover`, { method: 'POST' });
+        let body = null;
+        try { body = await res.json(); } catch (e) { body = null; }
+        let text;
+        if (!res.ok) {
+            text = `Recover failed: ${body?.detail || res.status}. Clear the light curtain / release the E-stop and try again.`;
+        } else {
+            const axes = Object.entries(body?.axes || {}).map(([axis, s]) => `${axis}: ${s}`).join(', ');
+            text = body?.status === 'recovered'
+                ? `Recovered (${axes}). Nothing moved. Retry the step, or Abort, then retract Z and Home All.`
+                : `Recovery incomplete (${axes}). Do not continue; check the instrument.`;
+        }
+        if (detailsEl) detailsEl.textContent = text;
+    } finally {
+        if (recoverBtn) recoverBtn.disabled = false;
+    }
 }
 
 async function submitTaskPromptAction(endpoint, pendingText) {
@@ -7615,6 +7646,9 @@ async function submitTaskPromptAction(endpoint, pendingText) {
             taskPromptState.actionPending = false;
             taskPromptState.pendingDetails = '';
             updateTaskPromptModalFromState(taskPromptState.lastTaskStatus);
+            // A refused Retry/Ignore says why (e.g. Recover first after a safety stop).
+            const detailsEl = document.getElementById('task-prompt-details');
+            if (res?.reason && detailsEl) detailsEl.textContent = `Not accepted: ${res.reason}`;
             return;
         }
         // Eagerly hide the overlay and reset state. The backend has accepted
@@ -7669,6 +7703,9 @@ document.getElementById('task-prompt-ignore')?.addEventListener('click', () => {
 });
 document.getElementById('task-prompt-abort')?.addEventListener('click', () => {
     submitTaskPromptAction('/api/abort', 'Aborting the workflow...');
+});
+document.getElementById('task-prompt-recover')?.addEventListener('click', () => {
+    recoverFromTaskPrompt();
 });
 
 // Auto-save to localStorage

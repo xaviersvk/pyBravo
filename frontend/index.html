@@ -1068,6 +1068,7 @@
             <button class="btn" id="btn-init">Initialize</button>
             <button class="btn" id="btn-home">Home All</button>
             <button class="btn btn-danger" id="btn-abort">Abort</button>
+            <button class="btn" id="btn-recover" title="After a safety stop (light curtain / E-stop): clear it, then press Recover to re-enable the axes. Nothing moves; retract Z and Home All afterwards.">Recover</button>
             <button class="btn btn-danger" id="btn-quit" title="Kill the backend server">Quit</button>
         </div>
     </div>
@@ -2284,6 +2285,7 @@
         </div>
         <div class="modal-footer">
             <button class="btn" id="task-prompt-abort">Abort</button>
+            <button class="btn" id="task-prompt-recover" style="display:none" title="Re-enable the axes after the safety stop is cleared. Moves nothing.">Recover</button>
             <button class="btn" id="task-prompt-ignore">Ignore</button>
             <button class="btn btn-primary" id="task-prompt-retry">Retry</button>
         </div>

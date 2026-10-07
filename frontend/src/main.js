@@ -3158,6 +3158,7 @@ function updateTaskPromptModal() {
     const retryBtn = document.getElementById('task-prompt-retry');
     const ignoreBtn = document.getElementById('task-prompt-ignore');
     const abortBtn = document.getElementById('task-prompt-abort');
+    const recoverBtn = document.getElementById('task-prompt-recover');
     if (!overlay || !titleEl || !messageEl || !detailsEl || !retryBtn || !ignoreBtn || !abortBtn) return;
 
     const prompt = state.taskStatus?.operator_prompt;
@@ -3176,6 +3177,7 @@ function updateTaskPromptModal() {
         retryBtn.disabled = false;
         ignoreBtn.disabled = false;
         abortBtn.disabled = false;
+        if (recoverBtn) recoverBtn.disabled = false;
         return;
     }
 
@@ -3202,10 +3204,31 @@ function updateTaskPromptModal() {
     retryBtn.style.display = choices.includes('retry') ? '' : 'none';
     ignoreBtn.style.display = choices.includes('ignore') ? '' : 'none';
     abortBtn.style.display = choices.includes('abort') ? '' : 'none';
+    if (recoverBtn) recoverBtn.style.display = choices.includes('recover') ? '' : 'none';
     retryBtn.disabled = state.taskPromptActionPending;
     ignoreBtn.disabled = state.taskPromptActionPending;
     abortBtn.disabled = state.taskPromptActionPending;
+    if (recoverBtn) recoverBtn.disabled = state.taskPromptActionPending;
     overlay.classList.add('open');
+}
+
+// Safety stop (light curtain / E-stop): re-enable the axes once the stop is
+// cleared. Moves nothing; afterwards Retry the step, or Abort, then retract Z
+// and Home All.
+async function recoverAfterSafetyStop() {
+    log('Recover: checking the safety interlock and re-enabling the axes...', 'info');
+    const res = await apiCall('/api/recover', 'POST');
+    if (!res) {
+        log('Recover failed. Clear the light curtain / release the E-stop and try again.', 'error');
+        return false;
+    }
+    const axes = Object.entries(res.axes || {}).map(([axis, s]) => `${axis}: ${s}`).join(', ');
+    if (res.status === 'recovered') {
+        log(`Recovered after the safety stop (${axes}). Nothing moved: Retry the step, or Abort, then retract Z and Home All.`, 'success');
+        return true;
+    }
+    log(`Recovery incomplete (${axes}). Do not continue; check the instrument.`, 'error');
+    return false;
 }
 
 async function submitTaskPromptAction(endpoint, ignoredMessage, level = 'info') {
@@ -3226,7 +3249,8 @@ async function submitTaskPromptAction(endpoint, ignoredMessage, level = 'info') 
         state.taskPromptActionPending = false;
         state.taskPromptPendingDetails = '';
         updateTaskPromptModal();
-        log(ignoredMessage, 'info');
+        // A refused Retry/Ignore says why (e.g. Recover first after a safety stop).
+        log(res.reason ? `Not accepted: ${res.reason}` : ignoredMessage, res.reason ? 'error' : 'info');
         return;
     }
     log(actionDescription.acceptedMessage, level);
@@ -3787,6 +3811,20 @@ document.getElementById('task-prompt-abort')?.addEventListener('click', async ()
         'That operator prompt is no longer waiting for input.',
         'error',
     );
+});
+
+document.getElementById('task-prompt-recover')?.addEventListener('click', async () => {
+    const btn = document.getElementById('task-prompt-recover');
+    if (btn) btn.disabled = true;
+    try {
+        await recoverAfterSafetyStop();
+    } finally {
+        if (btn) btn.disabled = false;
+    }
+});
+
+document.getElementById('btn-recover')?.addEventListener('click', async () => {
+    await recoverAfterSafetyStop();
 });
 
 // ══════════════════════════════════════════════════════════════════════
@@ -5082,6 +5120,14 @@ function watchAutofillRun(accessoryId) {
             autofillHoldAccessoryId = null;
             autofillLastSpeeds = {};
             autofillLastTarget = null;
+            if (runtime?.last_error) {
+                // The run was ended by a module error (fail closed). Leave the
+                // bus alone: no weight read here, and Live polling off.
+                setAutofillLive(false);
+                setAutofillStatus(`stopped by an error: ${runtime.last_error}`);
+                log(`Autofill stopped by an error: ${runtime.last_error}. Check the pumps; a power-cycle of the pump module may be needed.`, 'error');
+                return;
+            }
             setAutofillStatus('stopped');
             void readAutofillWeight(); // settle the level shown after the stop
             return;
