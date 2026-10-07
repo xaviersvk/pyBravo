@@ -217,7 +217,11 @@ the water while mixing instead, use one Pump Reagent with
 `run_second_pump` and `allow_concurrent` before the Mix.
 
 Pumps never outlive the workflow: stopping a workflow, or reaching its end
-however it ended, stops every autofill pump.
+however it ended, stops every autofill pump and ends every hold loop. A step
+that fails or is aborted ends the run before any later Pump Reagent starts, and
+an autofill fault during the run (module error, unreadable level) stops the
+pumps and fails the run; see
+[error handling during a run](#error-handling-during-a-run).
 
 Read Level publishes the level (in %) on its data output; `store_as` writes it
 to the blackboard.
@@ -399,6 +403,29 @@ same operator prompt as the control panel, resolved through `POST /api/retry`,
 `POST /api/ignore` or `POST /api/abort`. Ignoring a failed step continues with
 the instrument in a state the software may no longer be tracking accurately —
 see [safety](safety.md).
+
+**A node that did not complete ends the run.** If the operator answers Abort
+(or a Retry fails again and is then aborted), the task's node is reported as
+aborted (`workflow:task_aborted`), the run ends with `workflow:error`, and **no
+later node starts**. All autofill pumps are stopped and every hold loop and
+pump supervisor ends. The same happens when the run is stopped from the
+designer (`POST /api/workflows/stop`), when the control panel's Abort
+(`POST /api/abort`) is pressed during a run, and when a Script error is
+aborted. A stopped run never reports `workflow:complete`.
+
+**Safety stops.** If the light curtain is crossed or the E-stop pressed, the
+instrument disables the axes and the step fails with a safety stop. The prompt
+then says so and offers **Recover**, **Retry** and **Abort**, never Ignore. See
+[safety-stop recovery](hardware-setup.md#safety-stop-recovery) for the
+procedure: Retry is accepted only after Recover, at most twice per task.
+Aborting ends the run as described above.
+
+**Autofill faults.** If an autofill station reports a fault during the run (a
+module error or no reply while pumps run, or a hold or weigh-station step that
+cannot read the level), the pumps are stopped and the run ends with
+`workflow:error` at once. A step that is already moving finishes; nothing
+after it runs. See
+[autofill module errors](hardware-setup.md#autofill-module-errors-fail-closed).
 
 An unhandled error ends the run with an error event and leaves the status light
 signalling that attention is needed.

@@ -721,8 +721,73 @@ a stop, so every run is timed by the server, and pumps are also stopped on
 `POST /api/abort`, on disconnect, and whenever accessories are reconfigured.
 Keep the reservoir and waste lines in place before running pumps.
 
+**The module also stops its pumps when it is not polled.** While pumps run the
+server polls the pump module's status about three times a second (`AF`); the
+module stops its pumps by itself when that polling stops. This is why a module
+error must end the polling, not only send a stop.
+
+#### Autofill module errors fail closed
+
+The pump module answers every command with a status byte (0 = OK). If any
+command during a run gets a non-zero status, an unexpected reply or no reply at
+all, the server:
+
+1. ends the run at once, so the status polling stops and any hold loop or
+   weigh-station supervisor lets go of the pumps;
+2. sends the stop at most twice;
+3. records the error, shown as `runtime.last_error` in
+   `GET /api/accessories` and in the Accessories panel;
+4. keeps the accessory bus quiet for 5 s (only a manual **Stop pumps** is sent),
+   so that the module's own polling timeout stops the pumps even if it ignored
+   the stop;
+5. fails the running workflow, if there is one (`workflow:error`; no later
+   step starts).
+
+A hold or weigh-station step that cannot read the level (a read error, or no
+tare/range calibration any more) is treated the same way: it stops the pumps
+and ends, and never keeps regulating without a level.
+
+After such a stop, **check that the pumps really stopped** and that the tray
+did not overflow. If the module keeps reporting errors (for example status
+`0x0B` to every command after a safety stop of the instrument), it does not
+recover by itself: reconnecting or re-enabling the axes does not clear it.
+Power-cycle the pump module, or re-initialize it from the instrument, before
+running pumps again. pyBravo does not yet send a module re-initialization.
+
 In workflows, use the **Pump Reagent**, **Stop Pumps** and **Read Level** steps
 (see [Workflows → Accessories](workflows.md#accessories)).
+
+### Safety-stop recovery
+
+Crossing the light curtain or pressing the E-stop latches the instrument's
+safety interlock, and the controller disables the axes (on Darwin-generation
+instruments it broadcasts `STOP_DISABLE`). The step that was moving fails with a
+safety stop, and the operator prompt says so. Ignore is never offered for a
+safety stop, and Tips On does not try to retract Z against the disabled axes.
+
+To recover:
+
+1. Make the deck safe and clear the cause: step out of the light curtain, or
+   release the E-stop.
+2. Press **Recover** (in the prompt, or in the header of the control panel;
+   `POST /api/recover`). It checks that the interlock reads clear and re-enables
+   the axes the controller disabled. **It moves nothing.** It is refused while a
+   step is still executing, and it refuses (re-enabling nothing) when the
+   interlock is still latched or its state cannot be read.
+3. Then either:
+   - **Retry** the interrupted step. Retry is accepted only after a successful
+     Recover, and at most twice per task; or
+   - **Abort**. A running workflow then ends with an error and no later step
+     (such as a pump step) starts. Then retract Z (jog it up in the Jog tab)
+     and **Home All** before running again.
+
+pyBravo never moves an axis by itself as part of recovery. Check where the head
+stopped before retracting it: a head stopped mid-press may still be in contact
+with tips or labware.
+
+An autofill station that was pumping when the safety stop happened is stopped
+by the workflow failure. If its pump module then reports errors, see
+[autofill module errors](#autofill-module-errors-fail-closed).
 
 ---
 
