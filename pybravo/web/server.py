@@ -1155,18 +1155,28 @@ async def home():
 
 @app.post("/api/abort", **_route_meta("Connection", "Abort the active task", "Signals the task engine to abort the currently running operation after a fault or user stop request."))
 async def abort():
-    accepted = get_bravo().abort()
-    return {"status": "aborted", "accepted": bool(accepted)}
+    bravo = get_bravo()
+    accepted = bravo.abort()
+    # An operator Abort also ends a running workflow, so it can never carry
+    # on to the next node (a pump step, say) after the task it interrupted.
+    workflow_stopped = False
+    if _active_workflow_executor is not None:
+        _active_workflow_executor.abort("Workflow aborted by the operator")
+        workflow_stopped = True
+    return {"status": "aborted", "accepted": bool(accepted) or workflow_stopped,
+            "workflow_stopped": workflow_stopped}
 
-@app.post("/api/retry", **_route_meta("Connection", "Retry the last failed task step", "Instructs the task engine to retry the current failed state-machine step."))
+@app.post("/api/retry", **_route_meta("Connection", "Retry the last failed task step", "Instructs the task engine to retry the current failed state-machine step. After a safety stop, Retry is accepted only after Recover, and only a limited number of times."))
 async def retry():
-    accepted = get_bravo().retry()
-    return {"status": "retried", "accepted": bool(accepted)}
+    bravo = get_bravo()
+    accepted = bravo.retry()
+    return {"status": "retried", "accepted": bool(accepted), "reason": bravo._engine.last_refusal}
 
-@app.post("/api/ignore", **_route_meta("Connection", "Ignore the current task error and continue", "Tells the task engine to ignore the current error and continue to the next step, similar to continuing past a diagnostics fault."))
+@app.post("/api/ignore", **_route_meta("Connection", "Ignore the current task error and continue", "Tells the task engine to ignore the current error and continue to the next step, similar to continuing past a diagnostics fault. Refused for a step stopped by the safety interlock."))
 async def ignore_error():
-    accepted = get_bravo().ignore()
-    return {"status": "ignored", "accepted": bool(accepted)}
+    bravo = get_bravo()
+    accepted = bravo.ignore()
+    return {"status": "ignored", "accepted": bool(accepted), "reason": bravo._engine.last_refusal}
 
 @app.post("/api/recover", **_route_meta("Connection", "Recover after a safety stop", "After a light-curtain trip or E-stop: checks that the safety interlock is clear, then re-enables the axes the controller disabled. Moves nothing. Refused while a task step is still executing. Afterwards retract Z and Home All (or Retry the step the safety stop interrupted)."))
 async def recover_after_safety_stop():
