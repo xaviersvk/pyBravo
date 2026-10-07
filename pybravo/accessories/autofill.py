@@ -24,6 +24,14 @@ earlier traffic and carry no meaning.
 which arms a watchdog that sends the stop, and :meth:`close` stops anything
 still running. Tare and range are host-side calibration only; the module just
 reports raw A/D counts.
+
+**Module errors fail closed.** The module also stops its pumps by itself when
+the host stops polling it, so a module that answers with an error status (or
+does not answer) during a run is not polled again: the run ends at once (new
+run token, so the keepalive and any hold loop let go), the stop is sent at
+most twice, the error is kept in :attr:`AutofillStation.last_error`, and the
+bus is then left quiet for ``FAULT_QUIET_S`` so the module's own timeout can
+stop the pumps even if it ignored the stop.
 """
 
 from __future__ import annotations
@@ -45,6 +53,9 @@ CMD_READ_WEIGH_PAD = 0xB3
 DIRECTIONS = {"forward": 1, "reverse": 0}
 MAX_RUN_S = 600.0
 KEEPALIVE_INTERVAL_S = 0.3  # status polls while pumps run, as the instrument software does
+# After a module error ends a run, nothing but a manual stop is sent for this
+# long: any traffic may count as the polling that keeps the module's pumps on.
+FAULT_QUIET_S = 5.0
 
 SerialSender = Callable[[bytes], bytes]
 
@@ -116,10 +127,32 @@ class AutofillStation:
         self._run_token = 0
         self._stop_at: float | None = None
         self._speeds: dict[str, float] = {}  # pump role -> last commanded speed while running
+        self._last_error: str | None = None
+        self._fault_count = 0  # runs ended by a fault (module error, failed supervision)
+        self._quiet_until = 0.0  # monotonic time until which the bus is left alone
 
     @property
     def config(self) -> AutofillConfig:
         return self._config
+
+    @property
+    def last_error(self) -> str | None:
+        """The most recent module or supervision error, or None.
+
+        Cleared when a new run starts successfully.
+        """
+        return self._last_error
+
+    @property
+    def fault_count(self) -> int:
+        """How many runs a fault has ended; a workflow watches this to fail itself."""
+        return self._fault_count
+
+    def record_fault(self, message: str) -> None:
+        """Note a fault found outside the driver (e.g. a hold loop that cannot read the level)."""
+        with self._lock:
+            self._last_error = message
+            self._fault_count += 1
 
     @property
     def run_token(self) -> int:
@@ -192,6 +225,7 @@ class AutofillStation:
             commands.append(("empty", build_run_pump(p.module, p.pump, p.direction, speeds["empty"])))
 
         with self._lock:
+            self._check_not_quiet("start pumps")
             if self._running:
                 self.stop_pumps()
             self._run_token += 1
@@ -204,8 +238,11 @@ class AutofillStation:
                     self._send(payload, f"start {label} pump")
             except Exception:
                 logger.error("Autofill pump start failed; stopping all pumps")
-                self._stop_quietly()
+                # A module error has already ended the run and sent the stop.
+                if self._running:
+                    self._stop_quietly()
                 raise
+            self._last_error = None
             watchdog = threading.Thread(
                 target=self._watchdog, args=(token, duration_s), name="autofill-watchdog", daemon=True
             )
@@ -233,15 +270,29 @@ class AutofillStation:
             self._speeds[role] = float(speed_pct)
 
     def stop_pumps(self) -> None:
-        """Stop every pump on the module. Sent twice, as the stop is not acknowledged by state."""
+        """Stop every pump on the module. Sent twice, as the stop is not acknowledged by state.
+
+        Both stops are sent even if the first fails; the first error is then raised.
+        """
         with self._lock:
+            was_running = self._running
             self._run_token += 1
-            try:
-                self._send(build_stop_pumps(), "stop pumps")
-                self._send(build_stop_pumps(), "stop pumps (repeat)")
-            finally:
-                self._running = False
-                self._stop_at = None
+            self._running = False
+            self._stop_at = None
+            first_error: Exception | None = None
+            for label in ("stop pumps", "stop pumps (repeat)"):
+                try:
+                    self._send(build_stop_pumps(), label)
+                except Exception as exc:
+                    if first_error is None:
+                        first_error = exc
+            if first_error is not None:
+                self._last_error = str(first_error)
+                if was_running:
+                    # Same as any module error during a run: leave the bus quiet.
+                    self._fault_count += 1
+                    self._quiet_until = time.monotonic() + FAULT_QUIET_S
+                raise first_error
         logger.info("Autofill pumps stopped")
 
     def close(self) -> None:
@@ -263,14 +314,15 @@ class AutofillStation:
         with self._lock:
             if self._run_token != token:
                 return
-            for attempt in range(3):
-                try:
-                    self.stop_pumps()
-                    return
-                except Exception as exc:
-                    logger.error("Autofill watchdog stop attempt %d failed: %s", attempt + 1, exc)
-                    time.sleep(0.2)
-            logger.error("Autofill watchdog could not stop the pumps; they may still be running")
+            try:
+                self.stop_pumps()
+            except Exception as exc:
+                # Not repeated: a module answering with errors is left quiet
+                # so its own timeout stops the pumps (see stop_pumps).
+                logger.error(
+                    "Autofill watchdog could not stop the pumps (%s); the bus is left quiet so "
+                    "the module's own timeout stops them. Check the pumps.", exc,
+                )
 
     def _keepalive(self) -> None:
         """Poll the pump module's status while pumps run.
@@ -283,7 +335,10 @@ class AutofillStation:
             try:
                 self._send(build_pump_status(module), "pump status")
             except Exception as exc:
-                logger.warning("Autofill keepalive to module %d failed: %s", module, exc)
+                # ``_send`` has already ended the run, so the watchdog stops
+                # here too: never keep polling a module that reports errors.
+                logger.error("Autofill keepalive to module %d failed: %s; polling stopped", module, exc)
+                return
 
     def _stop_quietly(self) -> None:
         try:
@@ -291,7 +346,66 @@ class AutofillStation:
         except Exception:
             logger.exception("Could not stop autofill pumps")
 
+    def _end_run_on_module_error(self, label: str, exc: Exception) -> None:
+        """Fail closed after a module error (or no reply) during a run.
+
+        Ends the run at once (new run token: the watchdog stops its keepalive
+        polls and a hold loop lets go), sends the stop at most twice, records
+        the error and then leaves the bus quiet for ``FAULT_QUIET_S``.
+        """
+        with self._lock:
+            if not self._running:
+                return
+            self._run_token += 1
+            self._running = False
+            self._stop_at = None
+            self._last_error = str(exc)
+            self._fault_count += 1
+            logger.error(
+                "Autofill module error during a run (%s): %s. Run ended, keepalive polling "
+                "stopped; sending the stop (at most twice).",
+                label, exc,
+            )
+            stopped = False
+            for attempt in range(2):
+                try:
+                    self._transact(build_stop_pumps(), "stop pumps (after module error)")
+                    stopped = True
+                except Exception as stop_exc:
+                    logger.error("Autofill stop attempt %d after the module error failed: %s",
+                                 attempt + 1, stop_exc)
+            self._quiet_until = time.monotonic() + FAULT_QUIET_S
+        if stopped:
+            logger.warning("Autofill stop acknowledged after the module error; check that the pumps stopped")
+        else:
+            logger.error(
+                "The module did not acknowledge the stop. The bus is left quiet for %.0f s so the "
+                "module's own timeout stops the pumps; check them, and power-cycle the module "
+                "if it keeps reporting errors.", FAULT_QUIET_S,
+            )
+
+    def _check_not_quiet(self, label: str) -> None:
+        remaining = self._quiet_until - time.monotonic()
+        if remaining > 0:
+            raise AutofillError(
+                f"Autofill {label} refused: the module reported an error ({self._last_error}); "
+                f"the bus is kept quiet for another {remaining:.1f} s"
+            )
+
     def _send(self, payload: bytes, label: str) -> bytes:
+        is_stop = payload[0] == CMD_STOP_PUMPS
+        if not is_stop:
+            # A manual stop is always allowed; everything else waits out the quiet time.
+            self._check_not_quiet(label)
+        try:
+            return self._transact(payload, label)
+        except AutofillError as exc:
+            if not is_stop:
+                self._last_error = str(exc)
+                self._end_run_on_module_error(label, exc)
+            raise
+
+    def _transact(self, payload: bytes, label: str) -> bytes:
         try:
             sender = self._sender_provider()
             reply = sender(payload)

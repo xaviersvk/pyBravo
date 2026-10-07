@@ -338,6 +338,7 @@ class Bravo:
                         "seconds_remaining": getattr(driver, "seconds_remaining", None),
                         "hold": self._hold_runtime(device.id),
                         "pump_speeds": getattr(driver, "pump_speeds", None) or None,
+                        "last_error": getattr(driver, "last_error", None),
                     },
                 }
             )
@@ -435,7 +436,12 @@ class Bravo:
         return {"status": "stopped", "accessory_id": accessory_id}
 
     def stop_all_pumps(self) -> None:
-        """Best-effort stop of every autofill pump that this session started."""
+        """Best-effort stop of every autofill pump that this session started.
+
+        Also ends every hold loop and pump supervisor, so none of them can act
+        on a later run. A run that a module error already ended is not stopped
+        again (the driver sent its stops and keeps the bus quiet).
+        """
         from pybravo.accessories.autofill import AutofillStation
 
         for accessory_id, driver in list(self._accessories._drivers.items()):
@@ -444,6 +450,52 @@ class Bravo:
                     driver.stop_pumps()
                 except Exception:
                     logger.exception("Could not stop autofill pumps on %s", accessory_id)
+        for supervisor in list(self._pump_supervisors):
+            supervisor.cancel()
+        # A hold cancelled before its loop first ran never reaches its cleanup.
+        self._hold_controllers.clear()
+
+    def autofill_fault_count(self) -> int:
+        """Total faults (module errors, failed supervision) over all autofill stations.
+
+        Goes up whenever a fault ends a pump run; a running workflow fails when
+        it does.
+        """
+        from pybravo.accessories.autofill import AutofillStation
+
+        return sum(
+            driver.fault_count for driver in list(self._accessories._drivers.values())
+            if isinstance(driver, AutofillStation)
+        )
+
+    def autofill_errors(self) -> dict[str, str]:
+        """The last error of each autofill station that has one, by accessory id."""
+        from pybravo.accessories.autofill import AutofillStation
+
+        return {
+            accessory_id: driver.last_error
+            for accessory_id, driver in list(self._accessories._drivers.items())
+            if isinstance(driver, AutofillStation) and driver.last_error
+        }
+
+    def _fail_pump_run(self, driver: Any, location: int, what: str, exc: BaseException,
+                       *, own_run: int | None = None) -> str:
+        """Fail closed when supervising a pump run goes wrong.
+
+        Records the fault on the driver (so accessory status shows it and a
+        running workflow fails) and stops the run if it is still the one being
+        supervised. A module error has already ended the run in the driver.
+        """
+        message = f"{what} at location {location} ended: {exc}"
+        logger.error("%s; pumps stopped", message)
+        still_running = driver.is_running and (own_run is None or driver.run_token == own_run)
+        if still_running:
+            try:
+                driver.stop_pumps()
+            except Exception:
+                logger.exception("Could not stop autofill pumps after: %s", message)
+        driver.record_fault(message)
+        return message
 
     # Workflow steps (accessory/PumpReagent, StopPumps, ReadLevel). Async like
     # the other step methods so the workflow executor can await them. They
@@ -539,17 +591,39 @@ class Bravo:
         except AutofillError as exc:
             raise ValueError(str(exc)) from exc
 
+        own_run = driver.run_token
+        faults_before = driver.fault_count
+
         async def supervise() -> None:
             # The driver's watchdog ends the run at pump_on_time_s; this only
-            # ends it earlier when the weigh pad says the job is done.
-            while driver.is_running:
-                if use_weigh_station and reached_stop(level()):
-                    driver.stop_pumps()
-                    break
-                await asyncio.sleep(0.25)
+            # ends it earlier when the weigh pad says the job is done. Any
+            # failure (a level that cannot be read, a module error) fails
+            # closed: the run is stopped and the fault recorded.
+            try:
+                while driver.is_running:
+                    if use_weigh_station and reached_stop(level()):
+                        driver.stop_pumps()
+                        break
+                    await asyncio.sleep(0.25)
+            except Exception as exc:
+                raise RuntimeError(
+                    self._fail_pump_run(driver, location, "Pump Reagent supervision", exc, own_run=own_run)
+                ) from exc
+            if driver.fault_count != faults_before:
+                raise RuntimeError(
+                    f"Pump Reagent at location {location} ended by a module error: {driver.last_error}"
+                )
+
+        async def supervise_logged() -> None:
+            # Runs unawaited alongside later steps: log the failure instead
+            # of losing it (the fault is on the driver, so a workflow sees it).
+            try:
+                await supervise()
+            except RuntimeError as exc:
+                logger.error("%s", exc)
 
         if allow_concurrent:
-            task = asyncio.ensure_future(supervise())
+            task = asyncio.ensure_future(supervise_logged())
             self._pump_supervisors.add(task)
             task.add_done_callback(self._pump_supervisors.discard)
             result["status"] = "running"
@@ -602,13 +676,30 @@ class Bravo:
                                   "start_level_pct": float(start), "target_level_pct": target_pct}
 
         self._hold_controllers[accessory_id] = controller
+        faults_before = driver.fault_count
 
         async def regulate() -> None:
             try:
                 await _regulate()
+            except Exception as exc:
+                # Fail closed: a hold that cannot read the level (or talk to
+                # the module) cannot guard against overflow, so it never
+                # carries on blindly. A module error has already ended the run
+                # in the driver; anything else stops it here.
+                result["error"] = self._fail_pump_run(driver, location, "Hold level", exc, own_run=own_run)
             finally:
                 if self._hold_controllers.get(accessory_id) is controller:
                     del self._hold_controllers[accessory_id]
+            if "error" not in result and driver.fault_count != faults_before:
+                # The keepalive hit a module error: the driver ended the run.
+                result["error"] = f"Hold level at location {location} ended by a module error: {driver.last_error}"
+                logger.error("%s", result["error"])
+
+        def read_level_now() -> float:
+            value = driver.read_level()["level_pct"]
+            if value is None:
+                raise ValueError("the level cannot be computed (no tare/range calibration)")
+            return float(value)
 
         async def _regulate() -> None:
             inflow, drain = controller.inflow, controller.drain
@@ -617,7 +708,7 @@ class Bravo:
                 await asyncio.sleep(interval)
                 if not still_ours():
                     break
-                level_now = float(driver.read_level()["level_pct"])
+                level_now = read_level_now()
                 if level_now >= HOLD_OVERFLOW_GUARD_PCT:
                     # Never let a regulation problem overflow the tray.
                     driver.stop_pumps()
@@ -652,6 +743,8 @@ class Bravo:
             return result
 
         await regulate()
+        if result.get("error"):
+            raise RuntimeError(result["error"])
         result["status"] = "done"
         result["end_level_pct"] = driver.read_level()["level_pct"]
         return result
@@ -677,16 +770,16 @@ class Bravo:
         The pumps follow on the next regulation step, ramping at the
         controller's speed limit rather than jumping.
         """
+        if target_level_pct is not None and not 0.0 <= target_level_pct < HOLD_OVERFLOW_GUARD_PCT:
+            raise ValueError(f"target_level_pct must be from 0 to below {HOLD_OVERFLOW_GUARD_PCT:g} %")
+        if inflow_pct is not None and not 0.0 <= inflow_pct <= 100.0:
+            raise ValueError("inflow_pct must be from 0 to 100 %")
         controller = self._hold_controllers.get(accessory_id)
         if controller is None:
             raise ValueError(f"No Hold level is running on {accessory_id!r}")
         if target_level_pct is not None:
-            if not 0.0 <= target_level_pct < HOLD_OVERFLOW_GUARD_PCT:
-                raise ValueError(f"target_level_pct must be from 0 to below {HOLD_OVERFLOW_GUARD_PCT:g} %")
             controller.set_target(target_level_pct)
         if inflow_pct is not None:
-            if not 0.0 <= inflow_pct <= 100.0:
-                raise ValueError("inflow_pct must be from 0 to 100 %")
             controller.set_inflow(inflow_pct)
         return {"accessory_id": accessory_id, "target_level_pct": controller.requested_target,
                 "inflow_pct": controller.requested_inflow}
