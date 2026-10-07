@@ -81,6 +81,22 @@ Nabudúce:
   **Chyba v poradí krokov:** Hold beží súbežne a vráti sa hneď, takže prvý
   Mix začne v prázdnej vaničke. Pred Hold treba pridať „Fill by weight do
   ~80 %“.
+- **7. 10.: prvý protokol na HW.** Workflow „Reservoir: hold 75 % for 30 s at
+  target“ (`54910195…`): Initialize → Hold 75 % 30 s s „time from target“
+  → Empty podľa váhy. Spustený cez Execute vrátane inicializácie:
+  - cieľ dosiahnutý za 37 s (vrátane zavodnenia odtoku);
+  - 30 s držal 71,2–74,8 % pri prítoku 50 % a odtoku 20–26 %;
+  - potom vypustil vaničku na −1 %, pumpy vypnuté.
+  - Hladina sedí asi o 2 % pod cieľom.
+- **Nová voľba „time from target“** (`time_from_target`, `max_reach_time_s`
+  = 120 s). Čas holdu beží až od chvíle, keď sú hadice zavodnené a hladina je
+  ±2 % od cieľa. Ak cieľ nedosiahne do limitu, pumpy stopnú a krok zlyhá.
+  V ručnom paneli je to checkbox „time from target“.
+- **Vzduch v prívode.** Prvý pokus 7. 10. stál 110 s na 13 %: prívod mal
+  vzduch a na 50 % nič neťahal. Limit 120 s pumpy zastavil, takže pojazdka
+  zlyhala bezpečne. Pridané preto opätovné zavodnenie: keď sa hladina 4 s
+  nehýbe (prítok beží, odtok zatvorený), prítok ide znova na 100 %. Pri suchom
+  prívode to trvalo ~57 s.
 - PR #5 (do pôvodného repozitára) dopĺňa Hold level a sekciu „Hardware
   findings“. Na HW sa Hold skúšal len cez ručný panel, nie ako workflow.
   Posledná verzia zavodňovania je overená len v simulácii.
